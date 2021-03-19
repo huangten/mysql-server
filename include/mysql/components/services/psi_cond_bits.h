@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2020, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -22,6 +22,8 @@
 
 #ifndef COMPONENTS_SERVICES_PSI_COND_BITS_H
 #define COMPONENTS_SERVICES_PSI_COND_BITS_H
+
+#include <mysql/components/services/bits/psi_bits.h>
 
 /**
   @file
@@ -58,7 +60,7 @@ typedef unsigned int PSI_cond_key;
   Interface for an instrumented condition.
   This is an opaque structure.
 */
-struct PSI_cond;
+struct PSI_cond : PSI_instr {};
 typedef struct PSI_cond PSI_cond;
 
 /**

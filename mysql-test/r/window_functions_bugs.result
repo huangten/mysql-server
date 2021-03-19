@@ -369,7 +369,6 @@ EXPLAIN
       "windows": [
         {
           "name": "w1",
-          "using_temporary_table": true,
           "using_filesort": true,
           "filesort_key": [
             "`a`"
@@ -499,7 +498,7 @@ EXPLAIN
         {
           "name": "w2",
           "definition_position": 2,
-          "using_temporary_table": true,
+          "last_executed_window": true,
           "functions": [
             "rank"
           ]
@@ -601,11 +600,18 @@ EXPLAIN
       "windows": [
         {
           "name": "w1",
+          "using_filesort": true,
+          "filesort_key": [
+            "`a`"
+          ],
           "functions": [
             "rank"
           ]
         }
       ],
+      "cost_info": {
+        "sort_cost": "#"
+      },
       "table": {
         "table_name": "t",
         "access_type": "ALL",
@@ -970,14 +976,12 @@ CREATE TABLE t(
 a TEXT CHARACTER SET CP1251
 GENERATED ALWAYS AS (LPAD(1,10621933,10)) VIRTUAL,
 b BLOB
-GENERATED ALWAYS AS (LPAD(1,10621933,10)) VIRTUAL
+GENERATED ALWAYS AS (LPAD(1,10622,10)) VIRTUAL
 ) ENGINE=INNODB;
 INSERT INTO t VALUES (), ();
 Warnings:
 Warning	1265	Data truncated for column 'a' at row 1
-Warning	1265	Data truncated for column 'b' at row 1
 Warning	1265	Data truncated for column 'a' at row 2
-Warning	1265	Data truncated for column 'b' at row 2
 SET @f =
 (
 SELECT NTILE(39) OVER w1 FROM t

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -175,8 +175,7 @@ static int get_index_min_value(TABLE *table, TABLE_REF *ref,
          Check if case 1 from above holds. If it does, we should read
          the skipped tuple.
       */
-      if (item_field->field->real_maybe_null() &&
-          ref->key_buff[prefix_len] == 1 &&
+      if (item_field->field->is_nullable() && ref->key_buff[prefix_len] == 1 &&
           /*
             Last keypart (i.e. the argument to MIN) is set to NULL by
             find_key_for_maxmin only if all other keyparts are bound
@@ -186,7 +185,7 @@ static int get_index_min_value(TABLE *table, TABLE_REF *ref,
           */
           (error == HA_ERR_KEY_NOT_FOUND ||
            key_cmp_if_same(table, ref->key_buff, ref->key, prefix_len))) {
-        DBUG_ASSERT(item_field->field->real_maybe_null());
+        DBUG_ASSERT(item_field->field->is_nullable());
         error = table->file->ha_index_read_map(
             table->record[0], ref->key_buff,
             make_prev_keypart_map(ref->key_parts), HA_READ_KEY_EXACT);
@@ -224,7 +223,7 @@ static int get_index_max_value(TABLE *table, TABLE_REF *ref, uint range_fl) {
 
   @param[in]  thd               thread handler
   @param[in]  select            query block
-  @param[in]  all_fields        All fields to be returned
+  @param[in]  fields            All fields to be returned
   @param[in]  conds             WHERE clause
   @param[out] decision          outcome for successful execution
                = AGGR_REGULAR   regular execution required
@@ -273,8 +272,8 @@ static int get_index_max_value(TABLE *table, TABLE_REF *ref, uint range_fl) {
 */
 
 bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
-                               List<Item> &all_fields, Item *conds,
-                               aggregate_evaluated *decision) {
+                               const mem_root_deque<Item *> &fields,
+                               Item *conds, aggregate_evaluated *decision) {
   DBUG_TRACE;
 
   // True means at least one aggregate must be calculated by regular execution
@@ -313,6 +312,10 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
     something nondeterministic, we cannot mark the set function as constant:
    */
   if (where_tables & (OUTER_REF_TABLE_BIT | RAND_TABLE_BIT)) return false;
+
+  if (!select->sj_nests.empty())
+    // Cannot optimize when there is a semijoin or antijoin
+    return false;
 
   /*
     Analyze outer join dependencies, and, if possible, compute the number
@@ -373,9 +376,7 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
     COUNT(), MIN() and MAX() with constants (if possible).
   */
 
-  List_iterator_fast<Item> it(all_fields);
-  Item *item;
-  while ((item = it++)) {
+  for (Item *item : fields) {
     if (item->type() == Item::SUM_FUNC_ITEM && !item->m_is_window_function) {
       if (item->used_tables() & OUTER_REF_TABLE_BIT) {
         aggr_impossible = true;
@@ -392,11 +393,10 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
           /*
             If the expr in COUNT(expr) can never be null we can change this
             to the number of rows in the tables if this number is exact and
-            there are no outer joins nor semi-joins.
+            there are no outer joins.
           */
           if (conds == nullptr && !item_count->get_arg(0)->maybe_null &&
-              !inner_tables && !select->has_sj_nests && !select->has_aj_nests &&
-              tables_filled) {
+              !inner_tables && tables_filled) {
             if (delay_ha_records_to_exec_phase) {
               aggr_delayed = true;
             } else {
@@ -425,7 +425,7 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
                   the optimization phase by init_fts_funcs(), but search will
                   still only be done once.
           */
-          else if (tables->next_leaf == NULL &&  // 1
+          else if (tables->next_leaf == nullptr &&  // 1
                    (func_type == Item_func::FT_FUNC ||
                     func_type == Item_func::MATCH_FUNC) &&  // 2
                    (tables->table->file->ha_table_flags() &
@@ -438,8 +438,8 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
                     : down_cast<Item_func_match *>(
                           down_cast<Item_func_match_predicate *>(conds)
                               ->arguments()[0]);
-            fts_item->get_master()->set_hints(NULL, FT_NO_RANKING, HA_POS_ERROR,
-                                              false);
+            fts_item->get_master()->set_hints(nullptr, FT_NO_RANKING,
+                                              HA_POS_ERROR, false);
             if (fts_item->init_search(thd)) break;
             row_count = fts_item->get_count();
             have_exact_count = true;
@@ -469,19 +469,18 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
 
             ref.key_buff = key_buff;
             Item_field *item_field = down_cast<Item_field *>(expr);
-            TABLE *table = item_field->field->table;
+            TABLE_LIST *tr = item_field->table_ref;
+            TABLE *table = tr->table;
 
             /*
               We must not have accessed this table instance yet, because
               it must be private to this query block, as we already ensured
               that OUTER_REF_TABLE_BIT is not set.
+              Or: if this field references an outer table in the form of an
+              in-memory table with one row, it will have been read and closed
+              again. In such a case, the OUTER_REF_TABLE_BIT is no longer set.
             */
             DBUG_ASSERT(!table->file->inited);
-            /*
-              Because the table handle has not been opened yet, we cannot have
-              determined yet if the table contains 1 record.
-             */
-            DBUG_ASSERT(!table->const_table);
 
             /*
               Look for a partial key that can be used for optimization.
@@ -491,7 +490,7 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
               Type of range for the key part for this field will be
               returned in range_fl.
             */
-            if ((inner_tables & item_field->table_ref->map()) ||
+            if ((inner_tables & tr->map()) ||
                 !find_key_for_maxmin(is_max, &ref, item_field, conds, &range_fl,
                                      &prefix_len)) {
               aggr_impossible = true;
@@ -516,7 +515,7 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
             table->mark_columns_used_by_index_no_reset(ref.key, table->read_set,
                                                        ref.key_parts);
             // The aggregated column may or not be included in ref.key_parts.
-            bitmap_set_bit(table->read_set, item_field->field->field_index);
+            bitmap_set_bit(table->read_set, item_field->field->field_index());
             error = is_max ? get_index_max_value(table, &ref, range_fl)
                            : get_index_min_value(table, &ref, item_field,
                                                  range_fl, prefix_len);
@@ -547,7 +546,7 @@ bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
               table->file->print_error(error, MYF(0));
               return true;
             }
-            removed_tables |= item_field->table_ref->map();
+            removed_tables |= tr->map();
           } else if (!expr->const_item() || conds || !have_exact_count) {
             /*
               We get here if the aggregate function is not based on a field.
@@ -870,7 +869,7 @@ static bool matching_cond(bool max_fl, TABLE_REF *ref, KEY *keyinfo,
         If we have a non-nullable index, we cannot use it,
         since set_null will be ignored, and we will compare uninitialized data.
       */
-      if (!part->field->real_maybe_null()) return false;
+      if (!part->field->is_nullable()) return false;
       part->field->set_null();
       *key_ptr = (uchar)1;
     } else {
@@ -956,7 +955,7 @@ static bool find_key_for_maxmin(bool max_fl, TABLE_REF *ref,
                                 uint *range_fl, uint *prefix_len) {
   Field *const field = item_field->field;
 
-  if (!(field->flags & PART_KEY_FLAG)) return false;  // Not key field
+  if (!field->is_flag_set(PART_KEY_FLAG)) return false;  // Not key field
 
   DBUG_TRACE;
 
@@ -985,7 +984,7 @@ static bool find_key_for_maxmin(bool max_fl, TABLE_REF *ref,
 
       /* Check whether the index component is partial */
       Field *part_field = table->field[part->fieldnr - 1];
-      if ((part_field->flags & BLOB_FLAG) ||
+      if (part_field->is_flag_set(BLOB_FLAG) ||
           part->length < part_field->key_length())
         break;
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -38,6 +38,7 @@
 #include "my_loglevel.h"
 #include "my_macros.h"
 #include "my_sys.h"
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/components/services/log_shared.h"
 #include "mysql/components/services/psi_memory_bits.h"
@@ -47,7 +48,6 @@
 #include "mysql/psi/mysql_sp.h"
 #include "mysql/psi/mysql_stage.h"
 #include "mysql/psi/mysql_thread.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql_com.h"
 #include "mysqld_error.h"  // ER_*
 #include "sql/auth/auth_acls.h"
@@ -349,8 +349,8 @@ bool Events::create_event(THD *thd, Event_parse_data *parse_data,
   /* At create, one of them must be set */
   DBUG_ASSERT(parse_data->expression || parse_data->execute_at);
 
-  if (check_access(thd, EVENT_ACL, parse_data->dbname.str, NULL, NULL, false,
-                   false))
+  if (check_access(thd, EVENT_ACL, parse_data->dbname.str, nullptr, nullptr,
+                   false, false))
     return true;
 
   // Acquire exclusive MDL lock.
@@ -484,15 +484,15 @@ bool Events::update_event(THD *thd, Event_parse_data *parse_data,
   if (parse_data->check_parse_data(thd) || parse_data->do_not_create)
     return true;
 
-  if (check_access(thd, EVENT_ACL, parse_data->dbname.str, NULL, NULL, false,
-                   false))
+  if (check_access(thd, EVENT_ACL, parse_data->dbname.str, nullptr, nullptr,
+                   false, false))
     return true;
 
   if (lock_object_name(thd, MDL_key::EVENT, parse_data->dbname.str,
                        parse_data->name.str))
     return true;
 
-  if (new_dbname != NULL) /* It's a rename */
+  if (new_dbname != nullptr) /* It's a rename */
   {
     /* Check that the new and the old names differ. */
     if (!sortcmp_lex_string(parse_data->dbname, *new_dbname,
@@ -508,7 +508,8 @@ bool Events::update_event(THD *thd, Event_parse_data *parse_data,
       to tell the user that a database doesn't exist if they can not
       access it.
     */
-    if (check_access(thd, EVENT_ACL, new_dbname->str, NULL, NULL, false, false))
+    if (check_access(thd, EVENT_ACL, new_dbname->str, nullptr, nullptr, false,
+                     false))
       return true;
 
     //  Acquire mdl exclusive lock on target database name.
@@ -630,7 +631,7 @@ bool Events::drop_event(THD *thd, LEX_CSTRING dbname, LEX_CSTRING name,
                         bool if_exists) {
   DBUG_TRACE;
 
-  if (check_access(thd, EVENT_ACL, dbname.str, NULL, NULL, false, false))
+  if (check_access(thd, EVENT_ACL, dbname.str, nullptr, nullptr, false, false))
     return true;
 
   // Acquire exclusive MDL lock.
@@ -762,7 +763,7 @@ static bool send_show_create_event(THD *thd, Event_timed *et,
                                    Protocol *protocol) {
   char show_str_buf[10 * STRING_BUFFER_USUAL_SIZE];
   String show_str(show_str_buf, sizeof(show_str_buf), system_charset_info);
-  List<Item> field_list;
+  mem_root_deque<Item *> field_list(thd->mem_root);
   LEX_STRING sql_mode;
   const String *tz_name;
 
@@ -795,7 +796,7 @@ static bool send_show_create_event(THD *thd, Event_timed *et,
   field_list.push_back(
       new Item_empty_string("Database Collation", MY_CS_NAME_SIZE));
 
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
@@ -842,7 +843,7 @@ bool Events::show_create_event(THD *thd, LEX_CSTRING dbname, LEX_CSTRING name) {
   DBUG_TRACE;
   DBUG_PRINT("enter", ("name: %s@%s", dbname.str, name.str));
 
-  if (check_access(thd, EVENT_ACL, dbname.str, NULL, NULL, false, false))
+  if (check_access(thd, EVENT_ACL, dbname.str, nullptr, nullptr, false, false))
     return true;
 
   // We must make sure the schema is released and unlocked in the right
@@ -955,9 +956,9 @@ bool Events::init(bool opt_noacl_or_bootstrap) {
 end:
   if (res) {
     delete event_queue;
-    event_queue = NULL;
+    event_queue = nullptr;
     delete scheduler;
-    scheduler = NULL;
+    scheduler = nullptr;
   }
   delete thd;
 
@@ -979,9 +980,9 @@ void Events::deinit() {
 
   if (opt_event_scheduler != EVENTS_DISABLED) {
     delete scheduler;
-    scheduler = NULL; /* safety */
+    scheduler = nullptr; /* safety */
     delete event_queue;
-    event_queue = NULL; /* safety */
+    event_queue = nullptr; /* safety */
   }
 }
 
@@ -1146,6 +1147,15 @@ static bool load_events_from_db(THD *thd, Event_queue *event_queue) {
     if (thd->dd_client()->fetch_schema_components(schema_obj, &events))
       return true;
 
+    const char *converted_schema_name = schema_obj->name().c_str();
+    char name_buf[NAME_LEN + 1];
+    if (lower_case_table_names == 2) {
+      // Lower case table names == 2 is tested on OSX.
+      my_stpcpy(name_buf, converted_schema_name);
+      my_casedn_str(&my_charset_utf8_tolower_ci, name_buf);
+      converted_schema_name = name_buf;
+    }
+
     for (const dd::Event *ev_obj : events) {
       std::unique_ptr<Event_queue_element> et(new (std::nothrow)
                                                   Event_queue_element);
@@ -1154,7 +1164,7 @@ static bool load_events_from_db(THD *thd, Event_queue *event_queue) {
         return true;
       }
 
-      if (et->fill_event_info(thd, *ev_obj, schema_obj->name().c_str())) {
+      if (et->fill_event_info(thd, *ev_obj, converted_schema_name)) {
         LogErr(ERROR_LEVEL, ER_EVENT_SCHEDULER_GOT_BAD_DATA_FROM_TABLE);
         return true;
       }

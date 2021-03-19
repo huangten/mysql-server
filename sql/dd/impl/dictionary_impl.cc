@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -51,7 +51,8 @@
 #include "sql/dd/impl/tables/table_partitions.h"  // dd::tables::Table_partitions
 #include "sql/dd/impl/tables/tables.h"            // dd::tables::Tables
 #include "sql/dd/impl/tables/tablespaces.h"       // dd::tables::Tablespaces
-#include "sql/dd/impl/utils.h"                    // dd::tables::Tablespaces
+#include "sql/dd/impl/upgrade/server.h"
+#include "sql/dd/impl/utils.h"            // dd::tables::Tablespaces
 #include "sql/dd/info_schema/metadata.h"  // dd::info_schema::store_dynamic...
 #include "sql/dd/types/abstract_table.h"  // dd::Abstract_table::DD_table
 #include "sql/dd/types/column.h"          // dd::Column::DD_table
@@ -65,6 +66,7 @@
 #include "sql/derror.h"
 #include "sql/handler.h"
 #include "sql/mdl.h"
+#include "sql/mysqld.h"                 //next_query_id()
 #include "sql/opt_costconstantcache.h"  // init_optimizer_cost_module
 #include "sql/plugin_table.h"
 #include "sql/sql_base.h"   // close_cached_tables
@@ -88,7 +90,7 @@ namespace dd {
 class Object_table;
 class Table;
 
-Dictionary_impl *Dictionary_impl::s_instance = NULL;
+Dictionary_impl *Dictionary_impl::s_instance = nullptr;
 
 Dictionary_impl *Dictionary_impl::instance() { return s_instance; }
 
@@ -194,7 +196,7 @@ bool Dictionary_impl::shutdown() {
   if (!Dictionary_impl::s_instance) return true;
 
   delete Dictionary_impl::s_instance;
-  Dictionary_impl::s_instance = NULL;
+  Dictionary_impl::s_instance = nullptr;
 
   return false;
 }
@@ -259,6 +261,20 @@ uint Dictionary_impl::get_actual_P_S_version(THD *thd) {
 
 ///////////////////////////////////////////////////////////////////////////
 
+bool Dictionary_impl::get_actual_ndbinfo_schema_version(THD *thd, uint *ver) {
+  bool exists = false;
+  tables::DD_properties::instance().get(thd, "NDBINFO_VERSION", ver, &exists);
+  return exists;
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+uint Dictionary_impl::set_ndbinfo_schema_version(THD *thd, uint version) {
+  return tables::DD_properties::instance().set(thd, "NDBINFO_VERSION", version);
+}
+
+///////////////////////////////////////////////////////////////////////////
+
 uint Dictionary_impl::set_P_S_version(THD *thd, uint version) {
   return tables::DD_properties::instance().set(thd, "PS_VERSION", version);
 }
@@ -267,7 +283,7 @@ uint Dictionary_impl::set_P_S_version(THD *thd, uint version) {
 
 const Object_table *Dictionary_impl::get_dd_table(
     const String_type &schema_name, const String_type &table_name) const {
-  if (!is_dd_schema_name(schema_name)) return NULL;
+  if (!is_dd_schema_name(schema_name)) return nullptr;
 
   return System_tables::instance()->find_table(schema_name, table_name);
 }
@@ -595,7 +611,7 @@ bool create_native_table(THD *thd, const Plugin_table *pt) {
     4. Undo 1.
   */
   dd::cache::Dictionary_client *client = thd->dd_client();
-  const dd::Table *table_def = NULL;
+  const dd::Table *table_def = nullptr;
   if (client->acquire(pt->get_schema_name(), pt->get_name(), &table_def))
     return true;
 
@@ -644,7 +660,7 @@ bool drop_native_table(THD *thd, const char *schema_name,
     return true;
 
   dd::cache::Dictionary_client *client = thd->dd_client();
-  const dd::Table *table_def = NULL;
+  const dd::Table *table_def = nullptr;
   if (client->acquire(schema_name, table_name, &table_def)) {
     // Error is reported by the dictionary subsystem.
     return true;
@@ -717,6 +733,23 @@ void rename_tablespace_mdl_hook(THD *thd, MDL_ticket *src, MDL_ticket *dst) {
     return;
   }
   thd->locked_tables_list.add_rename_tablespace_mdls(src, dst);
+}
+
+bool alter_tablespace_encryption(THD *thd, const char *tablespace_name,
+                                 bool encryption) {
+  dd::upgrade::Bootstrap_error_handler error_handler;
+  bool save_log_error = dd::upgrade::Bootstrap_error_handler::m_log_error;
+  error_handler.set_log_error(false);
+
+  thd->set_query_id(next_query_id());
+
+  dd::String_type query = dd::String_type("ALTER TABLESPACE ") +
+                          tablespace_name + dd::String_type(" ENCRYPTION = ") +
+                          dd::String_type(encryption ? "'Y'" : "'N'");
+
+  bool res = execute_query(thd, query);
+  error_handler.set_log_error(save_log_error);
+  return res;
 }
 
 }  // namespace dd

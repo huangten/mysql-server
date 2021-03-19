@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -58,10 +58,12 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0vec.h"
 
 /** Build a table definition without updating SYSTEM TABLES
-@param[in,out]	table	dict table object
-@param[in,out]	trx	transaction instance
+@param[in,out]	table		dict table object
+@param[in]	create_info	HA_CREATE_INFO object
+@param[in,out]	trx		transaction instance
 @return DB_SUCCESS or error code */
-dberr_t dict_build_table_def(dict_table_t *table, trx_t *trx) {
+dberr_t dict_build_table_def(dict_table_t *table,
+                             const HA_CREATE_INFO *create_info, trx_t *trx) {
   std::string db_name;
   std::string tbl_name;
   dict_name::get_table(table->name.m_name, db_name, tbl_name);
@@ -84,12 +86,12 @@ dberr_t dict_build_table_def(dict_table_t *table, trx_t *trx) {
     dict_table_assign_new_id(table, trx);
   }
 
-  dberr_t err = dict_build_tablespace_for_table(table, trx);
+  dberr_t err = dict_build_tablespace_for_table(table, create_info, trx);
 
   return (err);
 }
 
-/** Build a tablespace to store various objects.
+/** Builds a tablespace to store various objects.
 @param[in,out]	trx		DD transaction
 @param[in,out]	tablespace	Tablespace object describing what to build.
 @return DB_SUCCESS or error code. */
@@ -104,7 +106,7 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
 
   DBUG_EXECUTE_IF("out_of_tablespace_disk", return (DB_OUT_OF_FILE_SPACE););
   /* Get a new space id. */
-  dict_hdr_get_new_id(NULL, NULL, &space, NULL, false);
+  dict_hdr_get_new_id(nullptr, nullptr, &space, nullptr, false);
   if (space == SPACE_UNKNOWN) {
     return (DB_ERROR);
   }
@@ -123,8 +125,8 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
     return DB_IO_ERROR;
   }
 
-  err = log_ddl->write_delete_space_log(trx, NULL, space, datafile->filepath(),
-                                        false, true);
+  err = log_ddl->write_delete_space_log(trx, nullptr, space,
+                                        datafile->filepath(), false, true);
   if (err != DB_SUCCESS) {
     return err;
   }
@@ -137,8 +139,15 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
   - page 3 will contain the root of the clustered index of the
   first table we create here. */
 
+  /* Set the initial size of the file being created. */
+  page_no_t size{};
+
+  size = tablespace->get_autoextend_size() > 0
+             ? (tablespace->get_autoextend_size() / srv_page_size)
+             : FIL_IBD_FILE_INITIAL_SIZE;
+
   err = fil_ibd_create(space, tablespace->name(), datafile->filepath(),
-                       tablespace->flags(), FIL_IBD_FILE_INITIAL_SIZE);
+                       tablespace->flags(), size);
 
   DBUG_INJECT_CRASH("ddl_crash_after_create_tablespace",
                     crash_injection_after_create_counter++);
@@ -156,7 +165,7 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
   mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO); */
   ut_a(!FSP_FLAGS_GET_TEMPORARY(tablespace->flags()));
 
-  bool ret = fsp_header_init(space, FIL_IBD_FILE_INITIAL_SIZE, &mtr, false);
+  bool ret = fsp_header_init(space, size, &mtr, false);
   mtr_commit(&mtr);
 
   DBUG_EXECUTE_IF("fil_ibd_create_log",
@@ -171,10 +180,13 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
 }
 
 /** Builds a tablespace to contain a table, using file-per-table=1.
-@param[in,out]	table	Table to build in its own tablespace.
-@param[in,out]	trx	Transaction
+@param[in,out]	table		Table to build in its own tablespace.
+@param[in]	create_info	HA_CREATE_INFO object
+@param[in,out]	trx		Transaction
 @return DB_SUCCESS or error code */
-dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
+dberr_t dict_build_tablespace_for_table(dict_table_t *table,
+                                        const HA_CREATE_INFO *create_info,
+                                        trx_t *trx) {
   dberr_t err = DB_SUCCESS;
   mtr_t mtr;
   space_id_t space = 0;
@@ -197,7 +209,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
           dict_table_has_atomic_blobs(table));
 
     /* Get a new tablespace ID */
-    dict_hdr_get_new_id(NULL, NULL, &space, table, false);
+    dict_hdr_get_new_id(nullptr, nullptr, &space, table, false);
 
     DBUG_EXECUTE_IF("ib_create_table_fail_out_of_space_ids",
                     space = SPACE_UNKNOWN;);
@@ -256,8 +268,13 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
     std::string tablespace_name(table->name.m_name);
     dict_name::convert_to_space(tablespace_name);
 
+    page_no_t size{};
+    size = create_info && create_info->m_implicit_tablespace_autoextend_size > 0
+               ? (create_info->m_implicit_tablespace_autoextend_size /
+                  srv_page_size)
+               : FIL_IBD_FILE_INITIAL_SIZE;
     err = fil_ibd_create(space, tablespace_name.c_str(), filepath, fsp_flags,
-                         FIL_IBD_FILE_INITIAL_SIZE);
+                         size);
 
     ut_free(filepath);
 
@@ -270,8 +287,15 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
 
     mtr_start(&mtr);
 
-    bool ret =
-        fsp_header_init(table->space, FIL_IBD_FILE_INITIAL_SIZE, &mtr, false);
+    bool ret = fsp_header_init(table->space, size, &mtr, false);
+
+    if (ret) {
+      fil_set_autoextend_size(
+          table->space,
+          (create_info ? create_info->m_implicit_tablespace_autoextend_size
+                       : 0));
+    }
+
     mtr_commit(&mtr);
 
     DBUG_EXECUTE_IF("fil_ibd_create_log",
@@ -290,7 +314,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
     is already built.  Just find the correct tablespace ID. */
 
     if (DICT_TF_HAS_SHARED_SPACE(table->flags)) {
-      ut_ad(table->tablespace != NULL);
+      ut_ad(table->tablespace != nullptr);
 
       ut_ad(table->space == fil_space_get_id_by_name(table->tablespace()));
     } else if (table->is_temporary()) {
@@ -331,8 +355,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
   return (DB_SUCCESS);
 }
 
-/** Builds an index definition
- @return DB_SUCCESS or error code */
+/** Builds an index definition */
 void dict_build_index_def(const dict_table_t *table, /*!< in: table */
                           dict_index_t *index,       /*!< in/out: index */
                           trx_t *trx) /*!< in/out: InnoDB transaction handle */
@@ -345,7 +368,7 @@ void dict_build_index_def(const dict_table_t *table, /*!< in: table */
       index->id = dd_upgrade_indexes_num++;
       ut_ad(index->id <= dd_get_total_indexes_num());
     } else {
-      dict_hdr_get_new_id(NULL, &index->id, NULL, table, false);
+      dict_hdr_get_new_id(nullptr, &index->id, nullptr, table, false);
     }
 
   } else {
@@ -534,7 +557,7 @@ static bool dict_foreign_base_for_stored(const char *col_name,
       /** If the stored column can refer to virtual column
       or stored column then it can points to NULL. */
 
-      if (s_col.base_col[j] == NULL) {
+      if (s_col.base_col[j] == nullptr) {
         continue;
       }
 
@@ -559,7 +582,7 @@ bool dict_foreigns_has_s_base_col(const dict_foreign_set &local_fk_set,
                                   const dict_table_t *table) {
   dict_foreign_t *foreign;
 
-  if (table->s_cols == NULL) {
+  if (table->s_cols == nullptr) {
     return (false);
   }
 
@@ -600,7 +623,7 @@ bool dict_foreigns_has_this_col(const dict_table_t *table,
   for (dict_foreign_set::const_iterator it = local_fk_set->begin();
        it != local_fk_set->end(); ++it) {
     foreign = *it;
-    ut_ad(foreign->id != NULL);
+    ut_ad(foreign->id != nullptr);
     ulint type = foreign->type;
 
     type &=
@@ -629,7 +652,7 @@ void dict_table_assign_new_id(dict_table_t *table, trx_t *trx) {
     to avoid confusion.*/
     table->id = ULINT_UNDEFINED;
   } else {
-    dict_hdr_get_new_id(&table->id, NULL, NULL, table, false);
+    dict_hdr_get_new_id(&table->id, nullptr, nullptr, table, false);
   }
 }
 
@@ -645,7 +668,7 @@ dict_index_t *dict_sdi_create_idx_in_mem(space_id_t space, bool space_discarded,
 
   /* This means the tablespace is evicted from cache */
   if (flags == UINT32_UNDEFINED) {
-    return (NULL);
+    return (nullptr);
   }
 
   ut_ad(fsp_flags_is_valid(flags));
@@ -654,7 +677,7 @@ dict_index_t *dict_sdi_create_idx_in_mem(space_id_t space, bool space_discarded,
 
   rec_format_t rec_format;
 
-  ulint zip_ssize = FSP_FLAGS_GET_ZIP_SSIZE(flags);
+  uint32_t zip_ssize = FSP_FLAGS_GET_ZIP_SSIZE(flags);
   ulint atomic_blobs = FSP_FLAGS_HAS_ATOMIC_BLOBS(flags);
   bool has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags);
   bool has_shared_space = FSP_FLAGS_GET_SHARED(flags);
@@ -680,14 +703,15 @@ dict_index_t *dict_sdi_create_idx_in_mem(space_id_t space, bool space_discarded,
       dict_mem_table_create(table_name, space, 5, 0, 0, table_flags, 0);
 
   dict_mem_table_add_col(table, heap, "type", DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED, 4);
+                         DATA_NOT_NULL | DATA_UNSIGNED, 4, true);
   dict_mem_table_add_col(table, heap, "id", DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED, 8);
+                         DATA_NOT_NULL | DATA_UNSIGNED, 8, true);
   dict_mem_table_add_col(table, heap, "compressed_len", DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED, 4);
+                         DATA_NOT_NULL | DATA_UNSIGNED, 4, true);
   dict_mem_table_add_col(table, heap, "uncompressed_len", DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED, 4);
-  dict_mem_table_add_col(table, heap, "data", DATA_BLOB, DATA_NOT_NULL, 0);
+                         DATA_NOT_NULL | DATA_UNSIGNED, 4, true);
+  dict_mem_table_add_col(table, heap, "data", DATA_BLOB, DATA_NOT_NULL, 0,
+                         true);
 
   table->id = dict_sdi_get_table_id(space);
 

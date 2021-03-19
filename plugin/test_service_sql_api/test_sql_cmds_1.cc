@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -145,7 +145,7 @@ struct st_send_field_n {
   enum_field_types type;
 };
 
-const CHARSET_INFO *sql_resultcs = NULL;
+const CHARSET_INFO *sql_resultcs = nullptr;
 uint sql_num_meta_rows = 0;
 uint sql_num_rows = 0;
 uint col_count = 0;
@@ -325,6 +325,7 @@ const struct st_command_service_cbs sql_cbs = {
     sql_handle_ok,
     sql_handle_error,
     sql_shutdown,
+    nullptr,
 };
 
 /****************************************************************************************/
@@ -334,7 +335,7 @@ static void test_com_query(void *p MY_ATTRIBUTE((unused))) {
 
   /* Session declarations */
   MYSQL_SESSION st_session;
-  void *plugin_ctx = NULL;
+  void *plugin_ctx = nullptr;
   bool session_ret = false;
   bool fail = false;
   COM_DATA cmd;
@@ -353,6 +354,7 @@ static void test_com_query(void *p MY_ATTRIBUTE((unused))) {
       "-----------------------------------------------------------------\n");
   memset(&sql_str_value, 0, 64 * 64 * 256 * sizeof(char));
   memset(&sql_str_len, 0, 64 * 64 * sizeof(size_t));
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = "SELECT id,info FROM information_schema.processlist";
   cmd.com_query.length = strlen(cmd.com_query.query);
   WRITE_VAL("%s\n", cmd.com_query.query);
@@ -390,6 +392,7 @@ static void test_com_query(void *p MY_ATTRIBUTE((unused))) {
       "-----------------------------------------------------------------\n");
   memset(&sql_str_value, 0, 64 * 64 * 256 * sizeof(char));
   memset(&sql_str_len, 0, 64 * 64 * sizeof(size_t));
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query =
       "SELECT * FROM performance_schema.global_variables WHERE variable_name "
       "LIKE 'INNODB_READ_IO_THREADS'";
@@ -427,6 +430,7 @@ static void test_com_query(void *p MY_ATTRIBUTE((unused))) {
 
   // 3. statement must fail
   cbd.reset();
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = "garbage";
   cmd.com_query.length = strlen(cmd.com_query.query);
 
@@ -524,7 +528,7 @@ struct Test_data {
   Test_data() {
     ready = 0;
     native_cond_init(&cond);
-    native_mutex_init(&mutex, NULL);
+    native_mutex_init(&mutex, nullptr);
   }
 
   ~Test_data() {
@@ -557,6 +561,7 @@ static void *test_session_thread(Test_data *tdata) {
   WRITE_VAL("session is dead? %i\n",
             thd_killed(srv_session_info_get_thd(tdata->session)));
 
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = "select sleep(10)";
   cmd.com_query.length = strlen("select sleep(10)");
 
@@ -581,7 +586,7 @@ static void *test_session_thread(Test_data *tdata) {
 
   srv_session_deinit_thread();
 
-  return NULL;
+  return nullptr;
 }
 
 static void session_error_cb(void *, unsigned int sql_errno,
@@ -635,6 +640,7 @@ static int test_query_kill(void *p) {
   snprintf(buffer, sizeof(buffer), "kill query %i",
            srv_session_info_get_session_id(st_session_victim));
   WRITE_STR("run KILL QUERY\n");
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = buffer;
   cmd.com_query.length = strlen(buffer);
   ENSURE_API_OK(command_service_run_command(
@@ -698,6 +704,7 @@ static int test_priv(void *p) {
 
   switch_user(root_session, user_privileged);
 
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = "create user ordinary@localhost";
   cmd.com_query.length = strlen(cmd.com_query.query);
   ENSURE_API_OK(command_service_run_command(
@@ -712,6 +719,7 @@ static int test_priv(void *p) {
     switch_user(ordinary_session, user_ordinary);
 
     cbd.reset();
+    memset(&cmd, 0, sizeof(cmd));
     cmd.com_query.query = "create user bogus@localhost";
     cmd.com_query.length = strlen(cmd.com_query.query);
     ENSURE_API_OK(command_service_run_command(
@@ -725,6 +733,7 @@ static int test_priv(void *p) {
   }
 
   cbd.reset();
+  memset(&cmd, 0, sizeof(cmd));
   cmd.com_query.query = "drop user ordinary@localhost";
   cmd.com_query.length = strlen(cmd.com_query.query);
   ENSURE_API_OK(command_service_run_command(
@@ -798,15 +807,15 @@ mysql_declare_plugin(test_daemon){
     MYSQL_DAEMON_PLUGIN,
     &test_sql_service_plugin,
     "test_sql_cmds_1",
-    "Horst Hunger, Andrey Hristov",
+    PLUGIN_AUTHOR_ORACLE,
     "Test sql service commands",
     PLUGIN_LICENSE_GPL,
     test_sql_service_plugin_init,   /* Plugin Init */
-    NULL,                           /* Plugin Check uninstall */
+    nullptr,                        /* Plugin Check uninstall */
     test_sql_service_plugin_deinit, /* Plugin Deinit */
     0x0100 /* 1.0 */,
-    NULL, /* status variables                */
-    NULL, /* system variables                */
-    NULL, /* config options                  */
-    0,    /* flags                           */
+    nullptr, /* status variables                */
+    nullptr, /* system variables                */
+    nullptr, /* config options                  */
+    0,       /* flags                           */
 } mysql_declare_plugin_end;

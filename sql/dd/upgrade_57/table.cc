@@ -1,4 +1,4 @@
-/* Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2017, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -47,8 +47,8 @@
 #include "my_loglevel.h"
 #include "my_sys.h"
 #include "my_user.h"  // parse_user
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/components/services/log_builtins.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/udf_registration_types.h"
 #include "mysql_com.h"
 #include "mysqld_error.h"                    // ER_*
@@ -59,6 +59,7 @@
 #include "sql/dd/dd_trigger.h"               // dd::create_trigger
 #include "sql/dd/dd_view.h"                  // create_view
 #include "sql/dd/dictionary.h"
+#include "sql/dd/impl/upgrade/server.h"
 #include "sql/dd/impl/utils.h"  // execute_query
 #include "sql/dd/properties.h"
 #include "sql/dd/string_type.h"
@@ -100,8 +101,6 @@
 #include "sql_string.h"
 #include "thr_lock.h"
 
-#include "sql/dd/impl/upgrade/server.h"
-
 class Sroutine_hash_entry;
 
 bool Table_trigger_dispatcher::reorder_57_list(MEM_ROOT *mem_root,
@@ -115,7 +114,7 @@ bool Table_trigger_dispatcher::reorder_57_list(MEM_ROOT *mem_root,
   }
 
   // The individual triggers are mem_root-allocated. We can now empty the list.
-  triggers->empty();
+  triggers->clear();
 
   // And then, we iterate over the chains and re-add the triggers to the list.
   for (int i = 0; i < (int)TRG_EVENT_MAX; i++)
@@ -250,7 +249,7 @@ static File_option trg_file_parameters[] = {
     {{STRING_WITH_LEN("created")},
      my_offsetof_upgrade(struct Trg_file_data, created_timestamps),
      FILE_OPTIONS_ULLLIST},
-    {{0, 0}, 0, FILE_OPTIONS_STRING}};
+    {{nullptr, 0}, 0, FILE_OPTIONS_STRING}};
 
 static File_option sql_modes_parameters = {
     {STRING_WITH_LEN("sql_modes")},
@@ -271,8 +270,8 @@ class Handle_old_incorrect_sql_modes_hook : public Unknown_key_hook {
 
  public:
   Handle_old_incorrect_sql_modes_hook(char *file_path) : m_path(file_path) {}
-  virtual bool process_unknown_string(const char *&unknown_key, uchar *base,
-                                      MEM_ROOT *mem_root, const char *end);
+  bool process_unknown_string(const char *&unknown_key, uchar *base,
+                              MEM_ROOT *mem_root, const char *end) override;
 };
 
 /**
@@ -445,7 +444,7 @@ bool Trigger_loader::load_triggers(THD *thd, MEM_ROOT *mem_root,
     LEX_CSTRING body_utf8 = {tmp_body_utf8, strlen(tmp_body_utf8)};
 
     // Allocate space to hold username and hostname.
-    char *pos = NULL;
+    char *pos = nullptr;
     if (!(pos = static_cast<char *>(mem_root->Alloc(USERNAME_LENGTH + 1)))) {
       LogErr(ERROR_LEVEL, ER_DD_TRG_DEFINER_OOM, "User");
       return true;
@@ -641,7 +640,7 @@ class Table_upgrade_guard {
 
   ~Table_upgrade_guard() {
     m_thd->variables.sql_mode = m_sql_mode;
-    m_thd->work_part_info = 0;
+    m_thd->work_part_info = nullptr;
 
     // Free item list for partitions
     if (m_table->s->m_part_info) free_items(m_table->s->m_part_info->item_list);
@@ -767,11 +766,11 @@ static bool create_unlinked_view(THD *thd, TABLE_LIST *view_ref) {
   TABLE_LIST *saved_query_tables = thd->lex->query_tables;
   SQL_I_List<Sroutine_hash_entry> saved_sroutines_list;
   // For creation of view without column information.
-  SELECT_LEX select(nullptr, nullptr);
+  SELECT_LEX select(thd->mem_root, nullptr, nullptr);
 
   // Backup
   thd->lex->select_lex = &select;
-  thd->lex->query_tables = NULL;
+  thd->lex->query_tables = nullptr;
   thd->lex->sroutines_list.save_and_clear(&saved_sroutines_list);
 
   dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
@@ -872,7 +871,7 @@ static bool fix_view_cols_and_deps(THD *thd, TABLE_LIST *view_ref,
   // Switch off modes which can prevent normal parsing of VIEW.
   Sql_mode_parse_guard parse_guard(thd);
 
-  String full_view_definition((char *)0, 0, m_connection_cl);
+  String full_view_definition((char *)nullptr, 0, m_connection_cl);
   create_alter_view_stmt(thd, view_ref, &full_view_definition, db_name,
                          view_name, m_connection_cl);
 
@@ -953,7 +952,7 @@ static bool migrate_view_to_dd(THD *thd, const FRM_context &frm_context,
 
   // Prepare default values for old format
   table_list.view_suid = true;
-  table_list.definer.user.str = table_list.definer.host.str = 0;
+  table_list.definer.user.str = table_list.definer.host.str = nullptr;
   table_list.definer.user.length = table_list.definer.host.length = 0;
 
   if (frm_context.view_def->parse(
@@ -1206,7 +1205,7 @@ static bool add_triggers_to_table(THD *thd, TABLE *table,
       Implicit_substatement_state_guard substatement_guard(thd);
 
       // Ordering of Triggers is taken care above, pass dummy arguments here.
-      LEX_CSTRING anchor_trigger_name{0, 0};
+      LEX_CSTRING anchor_trigger_name{nullptr, 0};
       if (dd::create_trigger(thd, t, enum_trigger_order_type::TRG_ORDER_NONE,
                              anchor_trigger_name)) {
         trans_rollback_stmt(thd);
@@ -1634,7 +1633,7 @@ static bool migrate_table_to_dd(THD *thd, const String_type &schema_name,
   uint key_count;
 
   // Foreign keys are handled at later stage by retrieving info from SE.
-  FOREIGN_KEY *dummy_fk_key_info = NULL;
+  FOREIGN_KEY *dummy_fk_key_info = nullptr;
   uint dummy_fk_key_count = 0;
 
   /* Suppress key length errors if this is a white listed table. */
@@ -1740,7 +1739,7 @@ static bool migrate_table_to_dd(THD *thd, const String_type &schema_name,
   }
   bootstrap_error_handler.set_log_error(true);
 
-  FOREIGN_KEY *fk_key_info_buffer = NULL;
+  FOREIGN_KEY *fk_key_info_buffer = nullptr;
   uint fk_number = 0;
   Sql_check_constraint_spec_list cc_spec_list_unused(thd->mem_root);
 
@@ -1776,6 +1775,10 @@ static bool migrate_table_to_dd(THD *thd, const String_type &schema_name,
       thd, *sch_obj, to_table_name, &create_info, alter_info.create_list,
       key_info_buffer, key_count, Alter_info::ENABLE, fk_key_info_buffer,
       fk_number, &cc_spec_list_unused, table.file);
+
+  // Check for usage of prefix key index in PARTITION BY KEY() function.
+  dd::warn_on_deprecated_prefix_key_partition(
+      thd, schema_name.c_str(), table_name.c_str(), table_def.get(), true);
 
   if (!table_def || thd->dd_client()->store(table_def.get())) {
     LogErr(ERROR_LEVEL, ER_DD_ERROR_CREATING_ENTRY, schema_name.c_str(),
@@ -1972,7 +1975,7 @@ bool migrate_all_frm_to_dd(THD *thd, const char *dbname,
         reported to user at once. Server code has many checks for error in DA.
         if thd->is_error() return true, atempt to upgrade all subsequent tables
         will fail and error log will report error false positives.
-     */
+       */
       thd->clear_error();
       root.ClearForReuse();
     }

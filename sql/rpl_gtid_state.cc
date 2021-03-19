@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -30,6 +30,7 @@
 #include "my_inttypes.h"
 #include "my_sys.h"
 #include "my_systime.h"
+#include "mysql/components/services/log_builtins.h"  //LogErr
 #include "mysql/components/services/psi_stage_bits.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "mysqld_error.h"
@@ -153,6 +154,7 @@ void Gtid_state::broadcast_owned_sidnos(const THD *thd) {
 void Gtid_state::update_commit_group(THD *first_thd) {
   DBUG_TRACE;
 
+  bool gtid_threshold_breach = false;
   /*
     We are going to loop in all sessions of the group commit in order to avoid
     being taking and releasing the global_sid_lock and sidno_lock for each
@@ -173,6 +175,9 @@ void Gtid_state::update_commit_group(THD *first_thd) {
 
     bool more_trx_with_same_gtid_next = update_gtids_impl_begin(thd);
 
+    if (!gtid_threshold_breach)
+      gtid_threshold_breach = (thd->owned_gtid.gno > GNO_WARNING_THRESHOLD);
+
     if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_GTID_SET) {
       update_gtids_impl_own_gtid_set(thd, is_commit);
     } else if (thd->owned_gtid.sidno > 0) {
@@ -189,6 +194,9 @@ void Gtid_state::update_commit_group(THD *first_thd) {
   update_gtids_impl_broadcast_and_unlock_sidnos();
 
   global_sid_lock->unlock();
+
+  if (gtid_threshold_breach)
+    LogErr(WARNING_LEVEL, ER_WARN_GTID_THRESHOLD_BREACH);
 }
 
 void Gtid_state::update_on_commit(THD *thd) {
@@ -215,6 +223,7 @@ void Gtid_state::update_gtids_impl(THD *thd, bool is_commit) {
   DEBUG_SYNC(thd, "update_gtid_state_before_global_sid_lock");
   global_sid_lock->rdlock();
   DEBUG_SYNC(thd, "update_gtid_state_after_global_sid_lock");
+  bool gtid_threshold_breach = (thd->owned_gtid.gno > GNO_WARNING_THRESHOLD);
 
   if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_GTID_SET) {
     update_gtids_impl_own_gtid_set(thd, is_commit);
@@ -232,6 +241,9 @@ void Gtid_state::update_gtids_impl(THD *thd, bool is_commit) {
   global_sid_lock->unlock();
 
   update_gtids_impl_end(thd, more_trx_with_same_gtid_next);
+
+  if (gtid_threshold_breach)
+    LogErr(WARNING_LEVEL, ER_WARN_GTID_THRESHOLD_BREACH);
 
   thd->owned_gtid.dbug_print(nullptr,
                              "set owned_gtid (clear) in update_gtids_impl");
@@ -390,6 +402,7 @@ bool Gtid_state::wait_for_gtid_set(THD *thd, Gtid_set *wait_for,
 
 rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const {
   DBUG_TRACE;
+  assert_sidno_lock_owner(sidno);
   Gtid_set::Const_interval_iterator ivit(&executed_gtids, sidno);
   /*
     When assigning new automatic GTIDs, we can optimize the assignment by start
@@ -468,7 +481,7 @@ enum_return_status Gtid_state::generate_automatic_gtid(
     sid_lock->assert_some_lock();
 
   // If GTID_MODE = ON_PERMISSIVE or ON, generate a new GTID
-  if (get_gtid_mode(GTID_MODE_LOCK_SID) >= GTID_MODE_ON_PERMISSIVE) {
+  if (global_gtid_mode.get() >= Gtid_mode::ON_PERMISSIVE) {
     Gtid automatic_gtid = {specified_sidno, specified_gno};
 
     if (automatic_gtid.sidno == 0) automatic_gtid.sidno = get_server_sidno();
@@ -500,9 +513,7 @@ enum_return_status Gtid_state::generate_automatic_gtid(
         next_free_gno = automatic_gtid.gno + 1;
     }
 
-    if (automatic_gtid.gno != -1)
-      acquire_ownership(thd, automatic_gtid);
-    else
+    if (automatic_gtid.gno == -1 || acquire_ownership(thd, automatic_gtid))
       ret = RETURN_STATUS_REPORTED_ERROR;
 
     /* The caller will unlock the sidno_lock if locked_sidno was passed */

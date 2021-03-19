@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -36,13 +36,13 @@
 #include "my_macros.h"
 #include "my_psi_config.h"
 #include "my_sys.h"
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/components/services/mysql_mutex_bits.h"
 #include "mysql/components/services/psi_mutex_bits.h"
 #include "mysql/plugin.h"  // MYSQL_XIDDATASIZE
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql/psi/mysql_transaction.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysql_com.h"
 #include "mysqld_error.h"
@@ -243,7 +243,7 @@ MEM_ROOT *Recovered_xa_transactions::get_allocated_memroot() {
 struct xarecover_st {
   int len, found_foreign_xids, found_my_xids;
   XA_recover_txn *list;
-  const memroot_unordered_set<my_xid> *commit_list;
+  const mem_root_unordered_set<my_xid> *commit_list;
   bool dry_run;
 };
 
@@ -365,17 +365,17 @@ static bool xarecover_handlerton(THD *, plugin_ref plugin, void *arg) {
   return false;
 }
 
-int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
+int ha_recover(const mem_root_unordered_set<my_xid> *commit_list) {
   xarecover_st info;
   DBUG_TRACE;
   info.found_foreign_xids = info.found_my_xids = 0;
   info.commit_list = commit_list;
-  info.dry_run =
-      (info.commit_list == 0 && tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
-  info.list = NULL;
+  info.dry_run = (info.commit_list == nullptr &&
+                  tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
+  info.list = nullptr;
 
   /* commit_list and tc_heuristic_recover cannot be set both */
-  DBUG_ASSERT(info.commit_list == 0 ||
+  DBUG_ASSERT(info.commit_list == nullptr ||
               tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
   /* if either is set, total_ha_2pc must be set too */
   DBUG_ASSERT(info.dry_run || total_ha_2pc > (ulong)opt_bin_log);
@@ -400,7 +400,7 @@ int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
   }
 
   for (info.len = MAX_XID_LIST_SIZE;
-       info.list == 0 && info.len > MIN_XID_LIST_SIZE; info.len /= 2) {
+       info.list == nullptr && info.len > MIN_XID_LIST_SIZE; info.len /= 2) {
     info.list = new (std::nothrow) XA_recover_txn[info.len];
   }
   if (!info.list) {
@@ -485,7 +485,13 @@ find_trn_for_recover_and_check_its_state(THD *thd,
       transaction_cache_search(xid_for_trn_in_recover);
 
   XID_STATE *xs = (transaction ? transaction->xid_state() : nullptr);
-  if (!xs || !xs->is_in_recovery()) {
+
+  /*
+    Check if formatID of transaction matches and transaction is in recovery
+    state.
+  */
+  if (!xs || !xs->get_xid()->eq(xid_for_trn_in_recover) ||
+      !xs->is_in_recovery()) {
     my_error(ER_XAER_NOTA, MYF(0));
     return nullptr;
   } else if (thd->in_active_multi_stmt_transaction()) {
@@ -1199,7 +1205,7 @@ bool Sql_cmd_xa_prepare::trans_xa_prepare(THD *thd) {
       if (!mdl_request.ticket) ha_rollback_trans(thd, true);
 
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-      DBUG_ASSERT(thd->m_transaction_psi == NULL);
+      DBUG_ASSERT(thd->m_transaction_psi == nullptr);
 #endif
 
       /*
@@ -1228,7 +1234,7 @@ bool Sql_cmd_xa_prepare::execute(THD *thd) {
   bool st = trans_xa_prepare(thd);
 
   if (!st) {
-    if (!thd->rpl_unflag_detached_engine_ha_data() ||
+    if (!thd->is_engine_ha_data_detached() ||
         !(st = applier_reset_xa_trans(thd)))
       my_ok(thd);
   }
@@ -1251,11 +1257,11 @@ bool Sql_cmd_xa_prepare::execute(THD *thd) {
 */
 
 bool Sql_cmd_xa_recover::trans_xa_recover(THD *thd) {
-  List<Item> field_list;
   Protocol *protocol = thd->get_protocol();
 
   DBUG_TRACE;
 
+  mem_root_deque<Item *> field_list(thd->mem_root);
   field_list.push_back(
       new Item_int(NAME_STRING("formatID"), 0, MY_INT32_NUM_DECIMAL_DIGITS));
   field_list.push_back(new Item_int(NAME_STRING("gtrid_length"), 0,
@@ -1264,7 +1270,7 @@ bool Sql_cmd_xa_recover::trans_xa_recover(THD *thd) {
                                     MY_INT32_NUM_DECIMAL_DIGITS));
   field_list.push_back(new Item_empty_string("data", XIDDATASIZE * 2 + 2));
 
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
@@ -1632,31 +1638,12 @@ static void attach_native_trx(THD *thd) {
 
   if (ha_info) {
     for (; ha_info; ha_info = ha_info_next) {
-      handlerton *hton = ha_info->ht();
-      reattach_engine_ha_data_to_thd(thd, hton);
       ha_info_next = ha_info->next();
       ha_info->reset();
     }
-  } else {
-    /*
-      Although the current `Ha_trx_info` object is null, we need to make sure
-      that the data engine plugins have the oportunity to attach their internal
-      transactions and clean up the session.
-     */
-    thd->rpl_reattach_engine_ha_data();
   }
+  thd->rpl_reattach_engine_ha_data();
 }
-
-/**
-  This is a specific to "slave" applier collection of standard cleanup
-  actions to reset XA transaction states at the end of XA prepare rather than
-  to do it at the transaction commit, see @c ha_commit_one_phase.
-  THD of the slave applier is dissociated from a transaction object in engine
-  that continues to exist there.
-
-  @param  thd current thread
-  @return the value of is_error()
-*/
 
 bool applier_reset_xa_trans(THD *thd) {
   DBUG_TRACE;
@@ -1688,11 +1675,11 @@ bool applier_reset_xa_trans(THD *thd) {
      previously saved is restored.
   */
   attach_native_trx(thd);
-  trn_ctx->set_ha_trx_info(Transaction_ctx::SESSION, NULL);
+  trn_ctx->set_ha_trx_info(Transaction_ctx::SESSION, nullptr);
   trn_ctx->set_no_2pc(Transaction_ctx::SESSION, false);
   trn_ctx->cleanup();
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  thd->m_transaction_psi = NULL;
+  thd->m_transaction_psi = nullptr;
 #endif
   thd->mdl_context.release_transactional_locks();
   /*
@@ -1735,7 +1722,7 @@ bool detach_native_trx(THD *thd, plugin_ref plugin, void *) {
     DBUG_ASSERT(!thd->get_ha_data(hton->slot)->ha_ptr_backup);
 
     hton->replace_native_transaction_in_thd(
-        thd, NULL, &thd->get_ha_data(hton->slot)->ha_ptr_backup);
+        thd, nullptr, &thd->get_ha_data(hton->slot)->ha_ptr_backup);
   }
 
   return false;
@@ -1749,8 +1736,8 @@ bool reattach_native_trx(THD *thd, plugin_ref plugin, void *) {
     /* restore the saved original engine transaction's link with thd */
     void **trx_backup = &thd->get_ha_data(hton->slot)->ha_ptr_backup;
 
-    hton->replace_native_transaction_in_thd(thd, *trx_backup, NULL);
-    *trx_backup = NULL;
+    hton->replace_native_transaction_in_thd(thd, *trx_backup, nullptr);
+    *trx_backup = nullptr;
   }
   return false;
 }

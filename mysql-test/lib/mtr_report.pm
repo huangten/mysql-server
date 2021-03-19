@@ -1,5 +1,5 @@
 # -*- cperl -*-
-# Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2004, 2020, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -199,6 +199,7 @@ sub mtr_report_test ($) {
   my $result   = $tinfo->{'result'};
   my $retry    = $tinfo->{'retries'} ? "retry-" : "";
   my $warnings = $tinfo->{'warnings'};
+  my $skip_ignored   = $tinfo->{'skip_ignored'};
 
   if ($::opt_test_progress and $tinfo->{'name'} and !$retry) {
     $tests_completed = $tests_completed + 1;
@@ -219,12 +220,12 @@ sub mtr_report_test ($) {
   }
 
   if ($result eq 'MTR_RES_FAILED') {
-    my $fail   = "fail";
+    my $fail = $skip_ignored ? "noskip-${retry}fail" : "${retry}fail";
     my $timest = format_time();
 
     if ($warnings) {
       mtr_report($report,
-                 "[ $retry$fail ]  Found warnings/errors in error log file!");
+                 "[ $fail ]  Found warnings/errors in error log file!");
       mtr_report("        Test ended at $timest");
       mtr_report($warnings);
     } else {
@@ -235,7 +236,7 @@ sub mtr_report_test ($) {
         mtr_report("\n$tinfo->{'comment'}");
         return;
       } else {
-        mtr_report($report, "[ $retry$fail ]\n        Test ended at $timest");
+        mtr_report($report, "[ $fail ]\n        Test ended at $timest");
       }
 
       if ($logfile) {
@@ -277,16 +278,19 @@ sub mtr_report_test ($) {
       }
     }
   } elsif ($result eq 'MTR_RES_PASSED') {
+
+    my $pass = $skip_ignored ? "noskip-${retry}pass" : "${retry}pass";
+
     my $timer_str = $tinfo->{timer} || "";
     $tot_real_time += ($timer_str / 1000);
     # Please note, that disk_usage() will print a space to separate
     # its information from the preceding string, if the disk usage report
     # is enabled. Otherwise an empty string is returned.
     if ($::opt_quiet) {
-      mtr_buffered_report(sprintf("%-60s%-s", $report, "[ ${retry}pass ]"));
+      mtr_buffered_report(sprintf("%-60s%-s", $report, "[ $pass ]"));
     } else {
       mtr_report($report,
-                 "[ ${retry}pass ] ",
+                 "[ $pass ] ",
                  sprintf("%5s%s", $timer_str, disk_usage()));
     }
 
@@ -517,10 +521,12 @@ sub mtr_generate_secondary_engine_offload_count_report($) {
   # Sort in order to group tests suitewise
   my @sorted_tests = sort { $a->{'name'} cmp $b->{'name'} } @$tests;
 
-  print $offload_count_file "=" x 70 . "\n";
-  print $offload_count_file " " x 3 . "TEST NAME" . " " x 38;
-  print $offload_count_file "OFFLOAD COUNT\n";
-  print $offload_count_file "-" x 70 . "\n";
+  if ($offload_count_file) {
+    print $offload_count_file "=" x 70 . "\n";
+    print $offload_count_file " " x 3 . "TEST NAME" . " " x 38;
+    print $offload_count_file "OFFLOAD COUNT\n";
+    print $offload_count_file "-" x 70 . "\n";
+  }
 
   foreach my $tinfo (@sorted_tests) {
     my $report_str =
@@ -528,7 +534,7 @@ sub mtr_generate_secondary_engine_offload_count_report($) {
     print $offload_count_file $report_str . "\n";
   }
 
-  print $offload_count_file "-" x 70 . "\n";
+  print $offload_count_file "-" x 70 . "\n" if $offload_count_file;
 }
 
 # Goes through the list of completed tests and accumulates various
@@ -707,7 +713,7 @@ sub mtr_report_stats ($$;$) {
     $xml_report_file->flush();
   }
 
-  if ($::secondary_engine_support) {
+  if ($::secondary_engine_support and $offload_count_file) {
     mtr_generate_secondary_engine_offload_count_report($tests);
     $offload_count_file->flush();
     $offload_count_file->close();

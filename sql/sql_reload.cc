@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -33,6 +33,7 @@
 #include "my_sys.h"
 #include "mysql_com.h"
 #include "mysqld_error.h"
+#include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"  // acl_reload, grant_reload
 #include "sql/binlog.h"
 #include "sql/conn_handler/connection_handler_impl.h"
@@ -54,6 +55,67 @@
 #include "sql/sql_servers.h"  // servers_reload
 #include "sql/system_variables.h"
 #include "sql/table.h"
+
+/**
+  Check the privileges required to execute a FLUSH command
+
+  Generally checks for @ref RELOAD_ACL. But for some sub-commands
+  it does accept alternative privs too. Or warns about deprecated
+  commands.
+
+  @param thd the current thread
+  @param op_type a bitmask of @ref group_cs_com_refresh_flags
+  @retval false if granted
+  @retval true if denied
+*/
+bool is_reload_request_denied(THD *thd, unsigned long op_type) {
+  DBUG_TRACE;
+  Security_context *sctx = thd->security_context();
+
+  if ((op_type & REFRESH_HOSTS)) {
+    push_deprecated_warn(thd, "FLUSH HOSTS",
+                         "TRUNCATE TABLE performance_schema.host_cache");
+  }
+  /*
+    First check RELOAD and stop if it's granted.
+    No need to pass DB since it's a global priv
+  */
+  if (sctx->check_access(RELOAD_ACL, thd->db().str ? thd->db().str : "", true))
+    return false;
+
+  if ((op_type & REFRESH_OPTIMIZER_COSTS) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("FLUSH_OPTIMIZER_COSTS")).first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "RELOAD or FLUSH_OPTIMIZER_COSTS");
+    return true;
+  }
+  if ((op_type & REFRESH_STATUS) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("FLUSH_STATUS")).first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "RELOAD or FLUSH_STATUS");
+    return true;
+  }
+  if ((op_type & REFRESH_USER_RESOURCES) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("FLUSH_USER_RESOURCES")).first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "RELOAD or FLUSH_USER_RESOURCES");
+    return true;
+  }
+  if ((op_type & (REFRESH_TABLES | REFRESH_FOR_EXPORT | REFRESH_READ_LOCK)) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("FLUSH_TABLES")).first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "RELOAD or FLUSH_TABLES");
+    return true;
+  }
+
+  op_type &=
+      ~(REFRESH_OPTIMIZER_COSTS | REFRESH_STATUS | REFRESH_USER_RESOURCES |
+        REFRESH_TABLES | REFRESH_FOR_EXPORT | REFRESH_READ_LOCK);
+
+  /* if it was just the above we're good */
+  if (!op_type) return false;
+
+  /* check again for remaining privs, if any */
+  return check_global_access(thd, RELOAD_ACL);
+}
 
 /**
   Reload/resets privileges and the different caches.
@@ -86,7 +148,7 @@ bool handle_reload_request(THD *thd, unsigned long options, TABLE_LIST *tables,
   DBUG_ASSERT(!thd || !thd->in_sub_stmt);
 
   if (options & REFRESH_GRANT) {
-    THD *tmp_thd = 0;
+    THD *tmp_thd = nullptr;
     /*
       If handle_reload_request() is called from SIGHUP handler we have to
       allocate temporary THD for execution of acl_reload()/grant_reload().
@@ -110,10 +172,10 @@ bool handle_reload_request(THD *thd, unsigned long options, TABLE_LIST *tables,
       }
     }
 
-    reset_mqh(thd, (LEX_USER *)NULL, true);
+    reset_mqh(thd, (LEX_USER *)nullptr, true);
     if (tmp_thd) {
       delete tmp_thd;
-      thd = 0;
+      thd = nullptr;
     }
   }
 
@@ -154,7 +216,7 @@ bool handle_reload_request(THD *thd, unsigned long options, TABLE_LIST *tables,
       If handle_reload_request() is called from SIGHUP handler we have to
       allocate temporary THD for execution of binlog/relay log rotation.
      */
-    THD *tmp_thd = 0;
+    THD *tmp_thd = nullptr;
     if (!thd && (thd = (tmp_thd = new THD))) {
       thd->thread_stack = (char *)(&tmp_thd);
       thd->store_globals();
@@ -179,7 +241,7 @@ bool handle_reload_request(THD *thd, unsigned long options, TABLE_LIST *tables,
       delete tmp_thd;
       /* Remember that we don't have a THD */
       current_thd = nullptr;
-      thd = 0;
+      thd = nullptr;
     }
   }
 
@@ -298,7 +360,7 @@ bool handle_reload_request(THD *thd, unsigned long options, TABLE_LIST *tables,
     }
   }
   if (options & REFRESH_OPTIMIZER_COSTS) reload_optimizer_cost_constants();
-  if (options & REFRESH_SLAVE) {
+  if (options & REFRESH_REPLICA) {
     tmp_write_to_binlog = 0;
     if (reset_slave_cmd(thd)) {
       /*NOTE: my_error() has been already called by reset_slave() */
@@ -407,7 +469,8 @@ bool flush_tables_with_read_lock(THD *thd, TABLE_LIST *all_tables) {
     IX and database-scope IX locks on the tables as this will make
     this statement incompatible with FLUSH TABLES WITH READ LOCK.
   */
-  if (lock_table_names(thd, all_tables, NULL, thd->variables.lock_wait_timeout,
+  if (lock_table_names(thd, all_tables, nullptr,
+                       thd->variables.lock_wait_timeout,
                        MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
     goto error;
 
@@ -419,7 +482,7 @@ bool flush_tables_with_read_lock(THD *thd, TABLE_LIST *all_tables) {
     tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED, table_list->db,
                      table_list->table_name, false);
     /* Reset ticket to satisfy asserts in open_tables(). */
-    table_list->mdl_request.ticket = NULL;
+    table_list->mdl_request.ticket = nullptr;
   }
 
   /*

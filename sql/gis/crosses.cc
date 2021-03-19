@@ -1,4 +1,4 @@
-// Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2017, 2020, Oracle and/or its affiliates.
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License, version 2.0,
@@ -201,11 +201,11 @@ static bool geometry_collection_apply_crosses(const Crosses &f,
           boost::geometry::de9im::mask mask("T********");
           boost::geometry::strategy::within::geographic_winding<
               Geographic_point>
-          geographic_pl_pa_strategy(
-              bg::srs::spheroid<double>(f.semi_major(), f.semi_minor()));
+              geographic_pl_pa_strategy(
+                  bg::srs::spheroid<double>(f.semi_major(), f.semi_minor()));
           boost::geometry::strategy::intersection::geographic_segments<>
-          geographic_ll_la_aa_strategy(
-              bg::srs::spheroid<double>(f.semi_major(), f.semi_minor()));
+              geographic_ll_la_aa_strategy(
+                  bg::srs::spheroid<double>(f.semi_major(), f.semi_minor()));
 
           shared_interior = bg::relate(
               *down_cast<Geographic_multipoint *>(g1_mpt.get()),
@@ -883,7 +883,7 @@ bool crosses(const dd::Spatial_reference_system *srs, const Geometry *g1,
     Crosses crosses_func(srs ? srs->semi_major_axis() : 0.0,
                          srs ? srs->semi_minor_axis() : 0.0);
     *crosses = crosses_func(g1, g2);
-  } catch (const null_value_exception &e) {
+  } catch (const null_value_exception &) {
     *null = true;
     return false;
   } catch (...) {

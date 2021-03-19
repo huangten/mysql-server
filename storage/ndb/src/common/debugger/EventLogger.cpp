@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -42,10 +42,6 @@
 //
 // PUBLIC
 //
-EventLoggerBase::~EventLoggerBase()
-{
-  
-}
 
 #define QQQQ char *m_text, size_t m_text_len, const Uint32* theData, Uint32 len
 
@@ -285,6 +281,8 @@ void getTextNodeFailCompleted(QQQQ) {
       line = "DBDIH";
     }else if (theData[1] == DBLQH){
       line = "DBLQH";
+    }else if (theData[1] == DBQLQH){
+      line = "DBQLQH";
     }
     BaseString::snprintf(m_text, m_text_len, 
 			 "Node failure of %u %s completed", 

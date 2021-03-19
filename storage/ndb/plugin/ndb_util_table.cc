@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -156,7 +156,8 @@ bool Ndb_util_table::open(bool reload_table) {
 
   const NdbDictionary::Table *tab = m_table_guard.get_table();
   if (!tab) {
-    push_warning("Failed to open table from NDB");
+    push_warning("Failed to open table %s.%s from NDB", m_db_name.c_str(),
+                 m_table_name.c_str());
     return false;
   }
 
@@ -455,6 +456,32 @@ bool Ndb_util_table::unpack_blob_not_null(NdbBlob *ndb_blob_handle,
   return true;
 }
 
+int Ndb_util_table::get_column_num(const char *col_name) const {
+  const NdbDictionary::Table *tab = get_table();
+  DBUG_ASSERT(tab != nullptr);
+  const NdbDictionary::Column *column = tab->getColumn(col_name);
+  DBUG_ASSERT(column != nullptr);
+  return column->getColumnNo();
+}
+
+bool Ndb_util_table::delete_all_rows() {
+  DBUG_TRACE;
+
+  const NdbDictionary::Table *ndb_table = get_table();
+  DBUG_ASSERT(ndb_table != nullptr);
+
+  NdbError ndb_err;
+  Ndb *ndb = m_thd_ndb->ndb;
+  const THD *thd = m_thd_ndb->get_thd();
+  if (!ndb_table_scan_and_delete_rows(ndb, thd, ndb_table, ndb_err)) {
+    push_ndb_error_warning(ndb_err);
+    push_warning("Failed to remove all rows from %s.%s", m_db_name.c_str(),
+                 m_table_name.c_str());
+    return false;
+  }
+  return true;
+}
+
 //
 //  Util_table_creator
 //
@@ -577,7 +604,7 @@ bool Util_table_creator::install_in_DD(bool reinstall) {
 
   Ndb_local_connection mysqld(m_thd);
   if (mysqld.create_util_table(m_util_table.define_table_dd())) {
-    ndb_log_error("Failed to create table defintion for '%s' in DD",
+    ndb_log_error("Failed to create table definition for '%s' in DD",
                   m_name.c_str());
     return false;
   }

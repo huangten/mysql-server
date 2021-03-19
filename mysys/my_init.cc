@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -52,6 +52,7 @@
 #include "my_psi_config.h"
 #include "my_sys.h"
 #include "my_thread.h"
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_file.h"
 #include "mysql/psi/mysql_memory.h"
@@ -59,7 +60,6 @@
 #include "mysql/psi/mysql_rwlock.h"
 #include "mysql/psi/mysql_stage.h"
 #include "mysql/psi/mysql_thread.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/psi/psi_cond.h"
 #include "mysql/psi/psi_file.h"
 #include "mysql/psi/psi_memory.h"
@@ -142,9 +142,10 @@ bool my_init() {
   my_umask_dir = 0750; /* Default umask for new directories */
 
   /* Default creation of new files */
-  if ((str = getenv("UMASK")) != 0) my_umask = (int)(atoi_octal(str) | 0600);
+  if ((str = getenv("UMASK")) != nullptr)
+    my_umask = (int)(atoi_octal(str) | 0600);
   /* Default creation of new dir's */
-  if ((str = getenv("UMASK_DIR")) != 0)
+  if ((str = getenv("UMASK_DIR")) != nullptr)
     my_umask_dir = (int)(atoi_octal(str) | 0700);
 
   if (my_thread_global_init()) return true;
@@ -152,7 +153,7 @@ bool my_init() {
   if (my_thread_init()) return true;
 
   /* $HOME is needed early to parse configuration files located in ~/ */
-  if ((home_dir = getenv("HOME")) != 0)
+  if ((home_dir = getenv("HOME")) != nullptr)
     home_dir = intern_filename(home_dir_buff, home_dir);
 
   {

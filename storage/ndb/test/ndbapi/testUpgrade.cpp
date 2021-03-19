@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2008, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -36,6 +36,7 @@
 #include <NdbEnv.h>
 #include <signaldata/DumpStateOrd.hpp>
 #include <string>
+#include <NdbInfo.hpp>
 
 static Vector<BaseString> table_list;
 
@@ -186,7 +187,7 @@ determineMaxFragCount(NDBT_Context* ctx, NDBT_Step* step)
   return fc;
 }
 
-static const Uint32 defaultManyTableCount = 70;
+static const Uint32 defaultManyTableCount = 35;
 
 int 
 createManyTables(NDBT_Context* ctx, NDBT_Step* step)
@@ -433,6 +434,170 @@ uint getNodeCount(NodeSet set, uint numNodes)
   }
 }
 
+static bool check_arbitration_setup(Ndb_cluster_connection* connection) {
+  NdbInfo ndbinfo(connection, "ndbinfo/");
+  if (!ndbinfo.init()) {
+    g_err << "ndbinfo.init failed" << endl;
+    return false;
+  }
+
+  const NdbInfo::Table* table;
+  if (ndbinfo.openTable("ndbinfo/membership", &table) != 0) {
+    g_err << "Failed to openTable(membership)" << endl;
+    return false;
+  }
+
+  NdbInfoScanOperation* scanOp = nullptr;
+  if (ndbinfo.createScanOperation(table, &scanOp)) {
+    g_err << "No NdbInfoScanOperation" << endl;
+    ndbinfo.closeTable(table);
+    return false;
+  }
+
+  if (scanOp->readTuples() != 0) {
+    g_err << "scanOp->readTuples failed" << endl;
+    ndbinfo.releaseScanOperation(scanOp);
+    ndbinfo.closeTable(table);
+    return false;
+  }
+
+  const NdbInfoRecAttr* arbitrator_nodeid_colval =
+      scanOp->getValue("arbitrator");
+  const NdbInfoRecAttr* arbitration_connection_status_colval =
+      scanOp->getValue("arb_connected");
+
+  if (scanOp->execute() != 0) {
+    g_err << "scanOp->execute failed" << endl;
+    ndbinfo.releaseScanOperation(scanOp);
+    ndbinfo.closeTable(table);
+    return false;
+  }
+
+  // Iterate through the result to check if arbitration has been set up
+  bool arbitration_setup = true;
+  do {
+    const int scan_next_result = scanOp->nextResult();
+    if (scan_next_result == -1) {
+      g_err << "Failure to process ndbinfo records" << endl;
+      ndbinfo.releaseScanOperation(scanOp);
+      ndbinfo.closeTable(table);
+      return false;
+    } else if (scan_next_result == 0) {
+      // All ndbinfo records processed
+      break;
+    } else {
+      // Check the arbitration status
+      const bool known_arbitrator =
+        (arbitrator_nodeid_colval->u_32_value() != 0);
+      const bool connected =
+        static_cast<bool>(arbitration_connection_status_colval->u_32_value());
+      arbitration_setup = known_arbitrator && connected;
+    }
+  } while (arbitration_setup);
+
+  if (!arbitration_setup) {
+    ndbout << "Waiting for arbitration to be set up" << endl;
+  }
+
+  ndbinfo.releaseScanOperation(scanOp);
+  ndbinfo.closeTable(table);
+  return arbitration_setup;
+}
+
+/**
+ * Perform up/downgrade of MGMDs
+ */
+int runChangeMgmds(NDBT_Context* ctx,
+                   NDBT_Step* step,
+                   NdbRestarter& restarter,
+                   AtrtClient& atrt,
+                   const uint clusterId,
+                   const NodeSet mgmdNodeSet)
+{
+  SqlResultSet mgmds;
+  if (!atrt.getMgmds(clusterId, mgmds))
+    return NDBT_FAILED;
+
+  const uint mgmdCount = mgmds.numRows();
+  uint restartCount = getNodeCount(mgmdNodeSet, mgmdCount);
+
+  if (ctx->getProperty("InitialMgmdRestart", Uint32(0)) == 1)
+  {
+    /**
+     * MGMD initial restart requires that all MGMDs are stopped,
+     * up/downgraded and started together
+     */
+    const char* mgmd_args = "--initial=1";
+
+    if (mgmdNodeSet != All &&
+        mgmdNodeSet != None)
+    {
+      ndbout << "Error cannot restart MGMDs --initial without restarting all."
+             << endl;
+      return NDBT_FAILED;
+    }
+
+    ndbout << "Restarting "
+             << restartCount << " of " << mgmdCount
+            << " mgmds with --initial" << endl;
+
+    uint startCount = restartCount;
+    while (mgmds.next() && restartCount --)
+    {
+      ndbout << "Stop mgmd " << mgmds.columnAsInt("node_id") << endl;
+      if (!atrt.stopProcess(mgmds.columnAsInt("id")) ||
+          !atrt.switchConfig(mgmds.columnAsInt("id"), mgmd_args))
+        return NDBT_FAILED;
+    }
+    mgmds.reset();
+    while (mgmds.next() && startCount --)
+    {
+      ndbout << "Start mgmd " << mgmds.columnAsInt("node_id") << endl;
+      if (!atrt.startProcess(mgmds.columnAsInt("id")))
+        return NDBT_FAILED;
+    }
+  }
+  else
+  {
+    /**
+     * MGMD rolling restart without initial, do one MGMD at a time
+     */
+    const char* mgmd_args = "--initial=0";
+
+    ndbout << "Restarting "
+             << restartCount << " of " << mgmdCount
+            << " mgmds" << endl;
+
+    while (mgmds.next() && restartCount --)
+    {
+      ndbout << "Restart mgmd " << mgmds.columnAsInt("node_id") << endl;
+      if (!atrt.changeVersion(mgmds.columnAsInt("id"), mgmd_args))
+        return NDBT_FAILED;
+
+      if(restarter.waitConnected())
+        return NDBT_FAILED;
+    }
+  }
+
+  bool arbitration_complete = false;
+  const int attempts = 10;
+  const int wait_time_ms = 500;
+  for (int a = 0; !arbitration_complete && a < attempts; a++) {
+    arbitration_complete = check_arbitration_setup(&ctx->m_cluster_connection);
+    if (!arbitration_complete) {
+      NdbSleep_MilliSleep(wait_time_ms);
+    }
+  }
+
+  if (!arbitration_complete) {
+    ndberr << "Failed to complete arbitration after "
+           << (attempts * wait_time_ms) / 1000 << " seconds" << endl;
+    return NDBT_FAILED;
+  }
+
+  return NDBT_OK;
+}
+
 
 /**
   Test that one node at a time can be upgraded
@@ -443,13 +608,6 @@ int runUpgrade_NR1(NDBT_Context* ctx, NDBT_Step* step){
 
   NodeSet mgmdNodeSet = (NodeSet) ctx->getProperty("MgmdNodeSet", Uint32(0));
   NodeSet ndbdNodeSet = (NodeSet) ctx->getProperty("NdbdNodeSet", Uint32(0));
-
-  const char * mgmd_args = "--initial=0";
-
-  if (ctx->getProperty("InitialMgmdRestart", Uint32(0)) == 1)
-  {
-    mgmd_args = "--initial=1";
-  }
 
   SqlResultSet clusters;
   if (!atrt.getClusters(clusters))
@@ -471,36 +629,23 @@ int runUpgrade_NR1(NDBT_Context* ctx, NDBT_Step* step){
       return NDBT_FAILED;
 
     // Restart ndb_mgmd(s)
-    SqlResultSet mgmds;
-    if (!atrt.getMgmds(clusterId, mgmds))
+    if (runChangeMgmds(ctx,
+                       step,
+                       restarter,
+                       atrt,
+                       clusterId,
+                       mgmdNodeSet) != NDBT_OK)
+    {
       return NDBT_FAILED;
-    
-    uint mgmdCount = mgmds.numRows();
-    uint mgmd_start_count = mgmdCount;
-    uint restartCount = getNodeCount(mgmdNodeSet, mgmdCount);
-      
-    while (mgmds.next() && mgmdCount --)
-    {
-      ndbout << "Restart mgmd" << mgmds.columnAsInt("node_id") << endl;
-      if (!atrt.stopProcess(mgmds.columnAsInt("id")) ||
-          !atrt.switchConfig(mgmds.columnAsInt("id"), mgmd_args))
-        return NDBT_FAILED;
     }
-    mgmds.reset();
-    while (mgmds.next() && mgmd_start_count --)
-    {
-      ndbout << "Restart mgmd" << mgmds.columnAsInt("node_id") << endl;
-      if (!atrt.startProcess(mgmds.columnAsInt("id")))
-        return NDBT_FAILED;
-    }
-    
+
     // Restart ndbd(s)
     SqlResultSet ndbds;
     if (!atrt.getNdbds(clusterId, ndbds))
       return NDBT_FAILED;
 
     uint ndbdCount = ndbds.numRows();
-    restartCount = getNodeCount(ndbdNodeSet, ndbdCount);
+    uint restartCount = getNodeCount(ndbdNodeSet, ndbdCount);
     
     ndbout << "Restarting "
              << restartCount << " of " << ndbdCount
@@ -553,16 +698,10 @@ runUpgrade_Half(NDBT_Context* ctx, NDBT_Step* step)
   const bool waitNode = ctx->getProperty("WaitNode", Uint32(0)) != 0;
   const bool event = ctx->getProperty("CreateDropEvent", Uint32(0)) != 0;
   const char * ndbd_args = "";
-  const char * mgmd_args = "--initial=0";
 
   if (ctx->getProperty("KeepFS", Uint32(0)) != 0)
   {
     ndbd_args = "--initial=0";
-  }
-
-  if (ctx->getProperty("InitialMgmdRestart", Uint32(0)) == 1)
-  {
-    mgmd_args = "--initial=1";
   }
 
   NodeSet mgmdNodeSet = (NodeSet) ctx->getProperty("MgmdNodeSet", Uint32(0));
@@ -588,28 +727,15 @@ runUpgrade_Half(NDBT_Context* ctx, NDBT_Step* step)
       return NDBT_FAILED;
 
     // Restart ndb_mgmd(s)
-    SqlResultSet mgmds;
-    if (!atrt.getMgmds(clusterId, mgmds))
-      return NDBT_FAILED;
-
-    uint mgmdCount = mgmds.numRows();
-    uint restartCount = getNodeCount(mgmdNodeSet, mgmdCount);
-    
-    ndbout << "Restarting "
-             << restartCount << " of " << mgmdCount
-            << " mgmds" << endl;
-      
-    while (mgmds.next() && restartCount --)
+    if (runChangeMgmds(ctx,
+                       step,
+                       restarter,
+                       atrt,
+                       clusterId,
+                       mgmdNodeSet) != NDBT_OK)
     {
-      ndbout << "Restart mgmd" << mgmds.columnAsInt("node_id") << endl;
-      if (!atrt.changeVersion(mgmds.columnAsInt("id"), mgmd_args))
-        return NDBT_FAILED;
-
-      if(restarter.waitConnected())
-        return NDBT_FAILED;
+      return NDBT_FAILED;
     }
-
-    NdbSleep_SecSleep(5); // TODO, handle arbitration
 
     // Restart one ndbd in each node group
     SqlResultSet ndbds;
@@ -627,7 +753,7 @@ runUpgrade_Half(NDBT_Context* ctx, NDBT_Step* step)
     }
 
     uint ndbdCount = ndbds.numRows();
-    restartCount = getNodeCount(ndbdNodeSet, ndbdCount);
+    uint restartCount = getNodeCount(ndbdNodeSet, ndbdCount);
     
     ndbout << "Restarting "
              << restartCount << " of " << ndbdCount
@@ -1659,14 +1785,8 @@ runUpgrade_SR(NDBT_Context* ctx, NDBT_Step* step)
   NodeSet mgmdNodeSet = All;
 
   const char * ndbd_args = "";
-  const char * mgmd_args = "--initial=0";
 
   bool skipMgmds = (ctx->getProperty("SkipMgmds", Uint32(0)) != 0);
-
-  if (ctx->getProperty("InitialMgmdRestart", Uint32(0)) == 1)
-  {
-    mgmd_args = "--initial=1";
-  }
 
   SqlResultSet clusters;
   if (!atrt.getClusters(clusters))
@@ -1703,30 +1823,17 @@ runUpgrade_SR(NDBT_Context* ctx, NDBT_Step* step)
     }
     
     // Restart ndb_mgmd(s)
-    SqlResultSet mgmds;
-    if (!atrt.getMgmds(clusterId, mgmds))
-      return NDBT_FAILED;
-
-    uint mgmdCount = mgmds.numRows();
-    uint restartCount = getNodeCount(mgmdNodeSet, mgmdCount);
-
     if (!skipMgmds)
     {
-      ndbout << "Restarting "
-             << restartCount << " of " << mgmdCount
-             << " mgmds" << endl;
-      
-      while (mgmds.next() && restartCount --)
+      if (runChangeMgmds(ctx,
+                         step,
+                         restarter,
+                         atrt,
+                         clusterId,
+                         mgmdNodeSet) != NDBT_OK)
       {
-        ndbout << "Restart mgmd" << mgmds.columnAsInt("node_id") << endl;
-        if (!atrt.changeVersion(mgmds.columnAsInt("id"), mgmd_args))
-          return NDBT_FAILED;
-        
-        if(restarter.waitConnected())
-          return NDBT_FAILED;
+        return NDBT_FAILED;
       }
-
-      NdbSleep_SecSleep(5); // TODO, handle arbitration
     }
     else
     {
@@ -1739,7 +1846,7 @@ runUpgrade_SR(NDBT_Context* ctx, NDBT_Step* step)
       return NDBT_FAILED;
 
     uint ndbdCount = ndbds.numRows();
-    restartCount = ndbdCount;
+    uint restartCount = ndbdCount;
     
     ndbout << "Upgrading "
              << restartCount << " of " << ndbdCount
@@ -1868,26 +1975,14 @@ runUpgradeAndFail(NDBT_Context* ctx, NDBT_Step* step)
     return NDBT_FAILED;
 
   // Restart ndb_mgmd(s)
-  SqlResultSet mgmds;
-  if (!atrt.getMgmds(clusterId, mgmds))
-    return NDBT_FAILED;
-
-  uint mgmdCount = mgmds.numRows();
-  uint restartCount = mgmdCount;
-
-  ndbout << "Restarting "
-      << restartCount << " of " << mgmdCount
-      << " mgmds" << endl;
-
-  while (mgmds.next() && restartCount --)
+  if (runChangeMgmds(ctx,
+                     step,
+                     restarter,
+                     atrt,
+                     clusterId,
+                     All) != NDBT_OK)
   {
-    ndbout << "Restart mgmd " << mgmds.columnAsInt("node_id") << endl;
-    if (!atrt.changeVersion(mgmds.columnAsInt("id"), ""))
-      return NDBT_FAILED;
-
-    if (restarter.waitConnected())
-      return NDBT_FAILED;
-    ndbout << "Connected to mgmd"<< endl;
+    return NDBT_FAILED;
   }
 
   ndbout << "Waiting for started"<< endl;
@@ -2111,7 +2206,7 @@ runReadVersions(NDBT_Context* ctx, NDBT_Step* step)
 /**
  * runSkipIfCannotKeepFS
  *
- * Check whether we can perform an upgrade while keeping the
+ * Check whether we can perform a test while keeping the
  * FS with the versions being tested.
  * If not, skip
  */
@@ -2124,13 +2219,36 @@ runSkipIfCannotKeepFS(NDBT_Context* ctx, NDBT_Step* step)
     return NDBT_OK;
   }
 
-  const Uint32 problemBoundary = NDB_MAKE_VERSION(7,6,3);  // NDBD_LOCAL_SYSFILE_VERSION
-
-  if (versionsSpanBoundary(preVersion, postVersion, problemBoundary))
+  /**
+   * Crossing the boundary of 7.6 is problematic for
+   * both upgrades and downgrades due to WL#8069 Partial LCP
+   */
   {
-    ndbout_c("Cannot run with these versions as they do not support "
-                  "non initial upgrades.");
-    return NDBT_SKIPPED;
+    const Uint32 problemBoundary = NDB_MAKE_VERSION(7,6,3);  // NDBD_LOCAL_SYSFILE_VERSION
+
+    if (versionsSpanBoundary(preVersion, postVersion, problemBoundary))
+    {
+      ndbout_c("Cannot run with these versions as they do not support "
+               "non initial upgrades or downgrades (WL#8069).");
+      return NDBT_SKIPPED;
+    }
+  }
+
+  /**
+   * Can upgrade across the boundary of 8.0.18, but cannot downgrade
+   * due to WL#12876 SYSFILE format version 2
+   */
+  {
+    const bool isDowngrade = postVersion < preVersion;
+    const Uint32 problemBoundary = NDB_MAKE_VERSION(8,0,18);
+
+    if (isDowngrade &&
+        versionsSpanBoundary(preVersion, postVersion, problemBoundary))
+    {
+      ndbout_c("Cannot run with these versions as they do not support "
+               "non initial downgrades (WL#12876)");
+      return NDBT_SKIPPED;
+    }
   }
   return NDBT_OK;
 }
@@ -2170,6 +2288,31 @@ runSkipIfPostCanKeepFS(NDBT_Context* ctx, NDBT_Step* step)
   return NDBT_OK;
 }
 
+static int
+restartDataNodesAtHalfWay(NDBT_Context* ctx, NDBT_Step* step)
+{
+  assert(ctx->getProperty("HalfStartedHold", Uint32(0)) == 1);
+  while(ctx->getProperty("HalfStartedDone", Uint32(0)) == 0 &&
+        !ctx->isTestStopped())
+  {
+    ndbout_c("Waiting for half changed");
+    NdbSleep_SecSleep(5);
+  }
+
+  if (ctx->isTestStopped())
+  {
+    return NDBT_OK;
+  }
+
+  ndbout_c("Got half changed, performing rolling restart (same version)");
+
+  int rc = rollingRestart(ctx, step);
+
+  ndbout_c("Rolling restart completed, resuming change process");
+  ctx->setProperty("HalfStartedHold", Uint32(0));
+
+  return rc;
+}
 
 NDBT_TESTSUITE(testUpgrade);
 TESTCASE("ShowVersions",
@@ -2478,6 +2621,33 @@ TESTCASE("Upgrade_Newer_LCP_FS_Fail",
   INITIALIZER(runSkipIfPostCanKeepFS);
   STEP(runUpgradeAndFail);
   // No postupgradecheck required as the upgrade is expected to fail
+}
+TESTCASE("ChangeHalfRestartChangeHalf",
+         "Try changing half datanodes, then rolling restart all "
+         "then changing the others")
+{
+  TC_PROPERTY("HalfStartedHold", Uint32(1));
+  // Don't restart MGMDs
+  TC_PROPERTY("MgmdNodeSet", Uint32(None));
+  INITIALIZER(runCheckStarted);
+  INITIALIZER(runReadVersions);
+  STEP(runUpgrade_Half);
+  STEP(restartDataNodesAtHalfWay);
+  // No postupgrade as we do not upgrade API
+}
+
+TESTCASE("ChangeMGMDChangeHalfRestartChangeHalf",
+         "Try changing MGMD then half datanodes, then rolling restart all "
+         "then changing the others")
+{
+  TC_PROPERTY("HalfStartedHold", Uint32(1));
+  // Restart MGMDs
+  TC_PROPERTY("MgmdNodeSet", Uint32(All));
+  INITIALIZER(runCheckStarted);
+  INITIALIZER(runReadVersions);
+  STEP(runUpgrade_Half);
+  STEP(restartDataNodesAtHalfWay);
+  // No postupgrade as we do not upgrade API
 }
 
 
@@ -2940,32 +3110,6 @@ TESTCASE("Downgrade_Mixed_MGMD_API_NDBD",
 }
 POSTUPGRADE("Downgrade_Mixed_MGMD_API_NDBD")
 {
-  INITIALIZER(runCheckStarted);
-  INITIALIZER(runPostUpgradeDecideDDL);
-  INITIALIZER(runGetTableList);
-  INITIALIZER(runClearAll); /* Clear rows from old-ver basic run */
-  STEP(runBasic);
-  STEP(runUpgrade_NdbdFirst); /* Upgrade all Ndbds, then MGMDs finally */
-  FINALIZER(runPostUpgradeChecks);
-  FINALIZER(runClearAll);
-}
-
-TESTCASE("Downgrade_Mixed_MGMD_API_NDBD_WithMGMDInitialStart",
-         "Test that downgrading MGMD/API partially before data nodes works")
-{
-  TC_PROPERTY("InitialMgmdRestart", Uint32(1));
-  INITIALIZER(runCheckStarted);
-  INITIALIZER(runReadVersions);
-  INITIALIZER(checkForDowngrade);
-  INITIALIZER(checkDowngradeCompatibleConfigFileformatVersion);
-  INITIALIZER(runCreateAllTables);
-  STEP(runUpgrade_NotAllMGMD); /* Upgrade an MGMD */
-  STEP(runBasic);
-  VERIFIER(startPostUpgradeChecksApiFirst); /* Upgrade Api */
-}
-POSTUPGRADE("Downgrade_Mixed_MGMD_API_NDBD_WithMGMDInitialStart")
-{
-  TC_PROPERTY("InitialMgmdRestart", Uint32(1));
   INITIALIZER(runCheckStarted);
   INITIALIZER(runPostUpgradeDecideDDL);
   INITIALIZER(runGetTableList);

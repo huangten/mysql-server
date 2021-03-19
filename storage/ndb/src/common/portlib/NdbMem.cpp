@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -29,6 +29,7 @@
 #else
 #include <stdlib.h> // aligned_alloc or posix_memalign
 #include <sys/mman.h>
+#include <unistd.h> // sysconf
 #endif
 
 #include <NdbMem.h>
@@ -103,7 +104,7 @@ int NdbMem_ReserveSpace(void** ptr, size_t len)
 #ifdef _WIN32
   p = VirtualAlloc(*ptr, len, MEM_RESERVE, PAGE_NOACCESS);
   *ptr = p;
-  return (p == NULL) ? 0 : -1;
+  return (p == NULL) ? -1 : 0;
 #elif defined(MAP_NORESERVE)
   /*
    * MAP_NORESERVE is essential to not reserve swap space on Solaris.
@@ -158,6 +159,7 @@ int NdbMem_ReserveSpace(void** ptr, size_t len)
 #error Need mmap() to not reserve swap for mapping.
 #endif
 }
+#endif
 
 /**
  * NdbMem_PopulateSpace
@@ -177,7 +179,7 @@ int NdbMem_PopulateSpace(void* ptr, size_t len)
 {
 #ifdef _WIN32
   void* p = VirtualAlloc(ptr, len, MEM_COMMIT, PAGE_READWRITE);
-  return (p == NULL) ? 0 : -1;
+  return (p == NULL) ? -1 : 0;
 #elif defined(MAP_GUARD) /* FreeBSD */
   void* p = mmap(ptr,
                  len,
@@ -206,6 +208,24 @@ int NdbMem_PopulateSpace(void* ptr, size_t len)
     ret = madvise(ptr, len, MADV_DODUMP);
     if (ret == -1)
     {
+#ifdef __sun
+      if (errno == EINVAL)
+      {
+        /*
+         * Assume reservation of space was done without MADV_DONTDUMP too.
+         * Probably not using NdbMem_ReserveSpace but by calling mmap in some
+         * other way.
+         * In that case all memory is dumped anyway.
+         *
+         * This was a problem when compiling on a newer Solaris supporting
+         * MADV_DONTDUMP and MADV_DODUMP and then running on an older Solaris
+         * not supporting these.
+         */
+        errno = 0;
+        return 0;
+      }
+#endif
+      /* Unexpected failure, make memory unaccessible again. */
       (void) mprotect(ptr, len, PROT_NONE);
     }
 #endif
@@ -213,6 +233,8 @@ int NdbMem_PopulateSpace(void* ptr, size_t len)
   return ret;
 #endif
 }
+
+#if defined(VM_TRACE) && !defined(__APPLE__)
 
 /**
  * NdbMem_FreeSpace
@@ -275,5 +297,16 @@ void NdbMem_AlignedFree(void* p)
   void** qp = (void**)p;
   p = qp[-1];
   free(p);
+#endif
+}
+
+size_t NdbMem_GetSystemPageSize()
+{
+#ifndef _WIN32
+  return (size_t) sysconf(_SC_PAGESIZE);
+#else
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  return si.dwPageSize;
 #endif
 }

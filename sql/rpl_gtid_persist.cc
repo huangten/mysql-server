@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -354,24 +354,24 @@ int Gtid_table_persistor::save(THD *thd, const Gtid *gtid) {
     goto end;
   }
 
-  /* Save the gtid info into table. */
-  error = write_row(table, buf, gtid->gno, gtid->gno);
+  /* Write directly to gtid_executed table only to satisfy debug test. */
+  DBUG_EXECUTE_IF("disable_se_persists_gtid",
+                  { error = write_row(table, buf, gtid->gno, gtid->gno); });
+
+  thd->request_persist_gtid_by_se();
+
+  DBUG_EXECUTE_IF("simulate_err_on_write_gtid_into_table", {
+    error = -1;
+    table->file->print_error(error, MYF(0));
+    thd->reset_gtid_persisted_by_se();
+  });
 
 end:
-  if (table_access_ctx.deinit(thd, table, 0 != error, false)) error = -1;
-
-  /* Do not protect m_atomic_count for improving transactions' concurrency */
-  if (error == 0 && gtid_executed_compression_period != 0) {
-    uint32 count = (uint32)m_atomic_count++;
-    if (count == gtid_executed_compression_period ||
-        DBUG_EVALUATE_IF("compress_gtid_table", 1, 0)) {
-      mysql_mutex_lock(&LOCK_compress_gtid_table);
-      should_compress = true;
-      mysql_cond_signal(&COND_compress_gtid_table);
-      mysql_mutex_unlock(&LOCK_compress_gtid_table);
-    }
+  if (table_access_ctx.deinit(thd, table, 0 != error, false)) {
+    thd->reset_gtid_persisted_by_se();
+    error = -1;
   }
-
+  /* Compression is triggered by GTID background thread as required. */
   return error;
 }
 
@@ -754,6 +754,10 @@ static void *compress_gtid_table(void *p_thd) {
       replication repository tables.
     */
     thd->set_skip_readonly_check();
+
+    // Compress the table at server startup
+    should_compress = true;
+
     for (;;) {
       mysql_mutex_lock(&LOCK_compress_gtid_table);
       if (terminate_compress_thread) break;
@@ -786,8 +790,8 @@ static void *compress_gtid_table(void *p_thd) {
     deinit_thd(thd);
   }
   my_thread_end();
-  my_thread_exit(0);
-  return 0;
+  my_thread_exit(nullptr);
+  return nullptr;
 }
 }  // extern "C"
 

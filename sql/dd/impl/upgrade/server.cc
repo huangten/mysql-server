@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -36,10 +36,12 @@
 #include "mysql/components/services/log_builtins.h"
 #include "scripts/mysql_fix_privilege_tables_sql.h"
 #include "scripts/sql_commands_system_tables_data_fix.h"
+#include "scripts/sql_firewall_stored_procedures.h"
 #include "sql/dd/cache/dictionary_client.h"  // dd::cache::Dictionary_client
 #include "sql/dd/dd_schema.h"                // dd::Schema_MDL_locker
-#include "sql/dd/dd_tablespace.h"            // dd::fill_table_and_parts...
-#include "sql/dd/dd_trigger.h"               // dd::create_trigger
+#include "sql/dd/dd_table.h"  // dd::warn_on_deprecated_prefix_key_partition
+#include "sql/dd/dd_tablespace.h"                 // dd::fill_table_and_parts...
+#include "sql/dd/dd_trigger.h"                    // dd::create_trigger
 #include "sql/dd/impl/bootstrap/bootstrap_ctx.h"  // dd::DD_bootstrap_ctx
 #include "sql/dd/impl/bootstrap/bootstrapper.h"
 #include "sql/dd/impl/tables/dd_properties.h"  // dd::tables::DD_properties
@@ -65,7 +67,7 @@ extern const char *fill_help_tables[];
 
 const char *upgrade_modes[] = {"NONE", "MINIMAL", "AUTO", "FORCE", NullS};
 TYPELIB upgrade_mode_typelib = {array_elements(upgrade_modes) - 1, "",
-                                upgrade_modes, NULL};
+                                upgrade_modes, nullptr};
 
 namespace dd {
 namespace upgrade {
@@ -100,8 +102,10 @@ void Bootstrap_error_handler::set_abort_on_error(uint error) {
 }
 
 Bootstrap_error_handler::Bootstrap_error_handler() {
-  m_old_error_handler_hook = error_handler_hook;
-  error_handler_hook = my_message_bootstrap;
+  if (error_handler_hook != my_message_sql) {
+    m_old_error_handler_hook = error_handler_hook;
+    error_handler_hook = my_message_bootstrap;
+  }
 }
 
 void Bootstrap_error_handler::set_log_error(bool log_error) {
@@ -109,7 +113,10 @@ void Bootstrap_error_handler::set_log_error(bool log_error) {
 }
 
 Bootstrap_error_handler::~Bootstrap_error_handler() {
-  error_handler_hook = m_old_error_handler_hook;
+  // Skip reverting to old error handler in case someone else
+  // has updated the hook.
+  if (error_handler_hook == my_message_bootstrap)
+    error_handler_hook = m_old_error_handler_hook;
 }
 
 bool Bootstrap_error_handler::m_log_error = true;
@@ -382,6 +389,44 @@ bool ignore_error_and_execute(THD *thd, const char *query_ptr) {
   return false;
 }
 
+/** upgrades Firewall stored procedures */
+static bool upgrade_firewall(THD *thd) {
+  bool has_old_firewall_tables{false};
+  bool has_new_firewall_tables{false};
+
+  {
+    // lock required tables before checking their existence
+    MDL_request request1, request2;
+    MDL_REQUEST_INIT(&request1, MDL_key::TABLE, INFORMATION_SCHEMA_NAME.str,
+                     "MYSQL_FIREWALL_USERS", MDL_SHARED, MDL_TRANSACTION);
+    MDL_REQUEST_INIT(&request2, MDL_key::TABLE, PERFORMANCE_SCHEMA_DB_NAME.str,
+                     "firewall_groups", MDL_SHARED, MDL_TRANSACTION);
+
+    // check whether firewall tables exist
+    bool error =
+        (thd->mdl_context.acquire_lock(&request1,
+                                       thd->variables.lock_wait_timeout) ||
+         thd->mdl_context.acquire_lock(&request2,
+                                       thd->variables.lock_wait_timeout) ||
+         dd::table_exists(thd->dd_client(), INFORMATION_SCHEMA_NAME.str,
+                          "MYSQL_FIREWALL_USERS", &has_old_firewall_tables) ||
+         dd::table_exists(thd->dd_client(), PERFORMANCE_SCHEMA_DB_NAME.str,
+                          "firewall_groups", &has_new_firewall_tables));
+
+    // release locks, leave on error
+    thd->mdl_context.release_transactional_locks();
+    if (error) return true;
+  }
+
+  // upgrade stored procedures, leave on error
+  if (has_old_firewall_tables && !has_new_firewall_tables)
+    for (auto query = &firewall_stored_procedures[0]; *query != nullptr;
+         query++)
+      if (ignore_error_and_execute(thd, *query)) return true;
+
+  return false;
+}
+
 bool fix_sys_schema(THD *thd) {
   /*
     Re-create SYS schema if:
@@ -410,7 +455,7 @@ bool fix_sys_schema(THD *thd) {
   const char **query_ptr;
   LogErr(INFORMATION_LEVEL, ER_SERVER_UPGRADE_SYS_SCHEMA);
   thd->user_var_events_alloc = thd->mem_root;
-  for (query_ptr = &mysql_sys_schema[0]; *query_ptr != NULL; query_ptr++)
+  for (query_ptr = &mysql_sys_schema[0]; *query_ptr != nullptr; query_ptr++)
     if (ignore_error_and_execute(thd, *query_ptr)) return true;
   thd->mem_root->Clear();
   return false;
@@ -419,18 +464,29 @@ bool fix_sys_schema(THD *thd) {
 bool fix_mysql_tables(THD *thd) {
   const char **query_ptr;
 
+  DBUG_EXECUTE_IF(
+      "schema_read_only",
+      if (dd::execute_query(thd, "CREATE SCHEMA schema_read_only") ||
+          dd::execute_query(thd, "ALTER SCHEMA schema_read_only READ ONLY=1") ||
+          dd::execute_query(thd, "CREATE TABLE schema_read_only.t(i INT)") ||
+          dd::execute_query(thd, "DROP SCHEMA schema_read_only") ||
+          dd::execute_query(thd, "CREATE TABLE IF NOT EXISTS S.upgrade(i INT)"))
+          DBUG_ASSERT(false););
+
   if (ignore_error_and_execute(thd, "USE mysql")) {
     LogErr(ERROR_LEVEL, ER_DD_UPGRADE_FAILED_FIND_VALID_DATA_DIR);
     return true;
   }
 
+  if (upgrade_firewall(thd)) return true;
+
   LogErr(INFORMATION_LEVEL, ER_SERVER_UPGRADE_MYSQL_TABLES);
-  for (query_ptr = &mysql_fix_privilege_tables[0]; *query_ptr != NULL;
+  for (query_ptr = &mysql_fix_privilege_tables[0]; *query_ptr != nullptr;
        query_ptr++)
     if (ignore_error_and_execute(thd, *query_ptr)) return true;
 
   LogErr(INFORMATION_LEVEL, ER_SERVER_UPGRADE_SYSTEM_TABLES);
-  for (query_ptr = &mysql_system_tables_data_fix[0]; *query_ptr != NULL;
+  for (query_ptr = &mysql_system_tables_data_fix[0]; *query_ptr != nullptr;
        query_ptr++)
     if (ignore_error_and_execute(thd, *query_ptr)) return true;
 
@@ -443,7 +499,7 @@ bool upgrade_help_tables(THD *thd) {
     return true;
   }
   LogErr(INFORMATION_LEVEL, ER_SERVER_UPGRADE_HELP_TABLE_STATUS, "started");
-  for (const char **query_ptr = &fill_help_tables[0]; *query_ptr != NULL;
+  for (const char **query_ptr = &fill_help_tables[0]; *query_ptr != nullptr;
        query_ptr++)
     if (dd::execute_query(thd, *query_ptr)) {
       LogErr(ERROR_LEVEL, ER_SERVER_UPGRADE_HELP_TABLE_STATUS, "failed");
@@ -502,6 +558,9 @@ bool do_server_upgrade_checks(THD *thd) {
 
     if (examine_each(&error_count, &tables, [&](const dd::Table *table) {
           (void)invalid_triggers(thd, schema->name().c_str(), *table);
+          // Check for usage of prefix key index in PARTITION BY KEY() function.
+          dd::warn_on_deprecated_prefix_key_partition(
+              thd, schema->name().c_str(), table->name().c_str(), table, true);
         }))
       break;
 
@@ -730,7 +789,7 @@ bool invalid_sql(THD *thd, const char *dbname, const dd::String_type &sql) {
   lex_start(thd);
 
   thd->m_parser_state = &parser_state;
-  parser_state.m_lip.m_digest = NULL;
+  parser_state.m_lip.m_digest = nullptr;
 
   if (thd->sql_parser())
     error = (thd->get_stmt_da()->mysql_errno() == ER_PARSE_ERROR);
@@ -822,7 +881,7 @@ bool upgrade_system_schemas(THD *thd) {
    * close everything.
    */
   close_thread_tables(thd);
-  close_cached_tables(NULL, NULL, false, LONG_TIMEOUT);
+  close_cached_tables(nullptr, nullptr, false, LONG_TIMEOUT);
 
   return dd::end_transaction(thd, err);
 }

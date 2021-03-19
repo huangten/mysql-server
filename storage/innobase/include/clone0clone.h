@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2018, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -1027,7 +1027,7 @@ class Clone_Sys {
   @param[in]	is_alert	print alert message
   @param[out]	result		true, if condition is satisfied
   @return error code */
-  using Wait_Cond_Cbk_Func = std::function<int(bool, bool &)>;
+  using Wait_Cond_Cbk_Func = std::function<int(bool is_alert, bool &result)>;
 
   /** Wait till the condition is satisfied or timeout.
   @param[in]	sleep_time	sleep time in milliseconds
@@ -1051,20 +1051,40 @@ class Clone_Sys {
     /* Call function once before waiting. */
     err = func(false, wait);
 
-    while (!is_timeout && wait && err == 0) {
-      ++loop_count;
+    /* Start with 1 ms sleep and increase upto target sleep time. */
+    Clone_Msec cur_sleep_time{1};
 
+    while (!is_timeout && wait && err == 0) {
       /* Release input mutex */
       if (mutex != nullptr) {
         ut_ad(mutex_own(mutex));
         mutex_exit(mutex);
       }
 
-      std::this_thread::sleep_for(sleep_time);
+      /* Limit sleep time to what is passed by caller. */
+      if (cur_sleep_time > sleep_time) {
+        cur_sleep_time = sleep_time;
+      }
+
+      std::this_thread::sleep_for(cur_sleep_time);
+
+      if (cur_sleep_time < sleep_time) {
+        /* Double sleep time in each iteration till we reach target. */
+        cur_sleep_time *= 2;
+      } else {
+        /* Increment count once we have reached target sleep time. */
+        ++loop_count;
+      }
 
       /* Acquire input mutex back */
       if (mutex != nullptr) {
         mutex_enter(mutex);
+      }
+
+      /* We have not yet reached the target sleep time. */
+      if (loop_count == 0) {
+        err = func(false, wait);
+        continue;
       }
 
       auto alert = (alert_count > 0) ? (loop_count % alert_count == 0) : true;

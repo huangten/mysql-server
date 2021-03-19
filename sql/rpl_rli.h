@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -91,6 +91,50 @@ typedef struct slave_job_item {
   my_off_t relay_pos;
 } Slave_job_item;
 
+/**
+  This class is used to store the type and value for
+  Assign_gtids_to_anonymous_transactions parameter of Change master command on
+  slave.
+*/
+class Assign_gtids_to_anonymous_transactions_info {
+ public:
+  /**
+    This accepted value of the type of the
+    Assign_gtids_to_anonymous_transactions info OFF :   Anonymous gtid events
+    won't be converted to Gtid event. LOCAL:  Anonymous gtid events will be
+    converted to Gtid event & the UUID used while create GTIDs will be the one
+    of replica which is the server where this transformation of anonymous to
+    gtid event happens. UUID: Anonymous gtid events will be converted to Gtid
+    event & the UUID used while create GTIDs will be the one specified via
+    Change master command to the parameter
+    ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS
+  */
+  enum class enum_type { AGAT_OFF = 1, AGAT_LOCAL, AGAT_UUID };
+  /**
+    The default constructor intializes the parameter to their default value
+  */
+  Assign_gtids_to_anonymous_transactions_info() {
+    set_info(enum_type::AGAT_OFF, "");
+    m_sidno = 0;
+  }
+  rpl_sidno get_sidno() const { return m_sidno; }
+  enum_type get_type() const;
+  std::string get_value() const;
+  /*
+    Here the assign_gtids_to_anonymous_transactions_value contains the textual
+    representation of the UUID used while creating a GTID.
+   */
+  bool set_info(enum_type assign_gtids_to_anonymous_transactions_type,
+                const char *assign_gtids_to_anonymous_transactions_value);
+
+ private:
+  /** This stores the type of Assign_gtids_to_anonymous_transactions info */
+  enum_type m_type;
+  /** Stores the UUID in case the m_type is not OFF */
+  std::string m_value;
+  // The sidno corresponding to the UUID value.
+  rpl_sidno m_sidno;
+};
 /*******************************************************************************
 Replication SQL Thread
 
@@ -225,6 +269,30 @@ class Relay_log_info : public Rpl_info {
     /** Flag counter.  Should always be last */
     STATE_FLAGS_COUNT
   };
+
+  /**
+    Identifies what is the slave policy on primary keys in tables.
+  */
+  enum enum_require_table_primary_key {
+    /**No policy, used on PFS*/
+    PK_CHECK_NONE = 0,
+    /**
+      The slave sets the value of sql_require_primary_key according to
+      the source replicated value.
+    */
+    PK_CHECK_STREAM = 1,
+    /** The slave enforces tables to have primary keys for a given channel*/
+    PK_CHECK_ON = 2,
+    /** The slave does not enforce any policy around primary keys*/
+    PK_CHECK_OFF = 3
+  };
+
+  /**
+    Stores the information related to the ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS
+    parameter of CHANGE MASTER
+  */
+  Assign_gtids_to_anonymous_transactions_info
+      m_assign_gtids_to_anonymous_transactions_info;
 
   /*
     The SQL thread owns one Relay_log_info, and each client that has
@@ -562,10 +630,26 @@ class Relay_log_info : public Rpl_info {
     only.
 
     @param require_row the flag value.
-
-     @return a status code describing the state of the data initialization.
    */
   void set_require_row_format(bool require_row);
+
+  /**
+     Returns what is the slave policy concerning primary keys on
+     replicated tables.
+
+     @return STREAM if it replicates the source values, ON if it enforces the
+             need on primary keys, OFF if it does no enforce any restrictions.
+   */
+  enum_require_table_primary_key get_require_table_primary_key_check() const;
+
+  /**
+    Sets the field that tells what is the slave policy concerning primary keys
+    on replicated tables.
+
+    @param require_pk the policy value.
+  */
+  void set_require_table_primary_key_check(
+      enum_require_table_primary_key require_pk);
 
   /*
     This will be used to verify transactions boundaries of events being applied
@@ -692,6 +776,16 @@ class Relay_log_info : public Rpl_info {
      Events: INTVAR_EVENT, RAND_EVENT, USER_VAR_EVENT
   */
   bool m_require_row_format;
+
+  /**
+    Identifies what is the slave policy on primary keys in tables.
+    If set to STREAM it just replicates the value of sql_require_primary_key.
+    If set to ON it fails when the source tries to replicate a table creation
+    or alter operation that does not have a primary key.
+    If set to OFF it does not enforce any policies on the channel for primary
+    keys.
+  */
+  enum_require_table_primary_key m_require_table_primary_key_check;
 
  public:
   bool is_relay_log_truncated() { return m_relay_log_truncated; }
@@ -1551,7 +1645,7 @@ class Relay_log_info : public Rpl_info {
                  PSI_mutex_key *param_key_info_sleep_cond,
 #endif
                  uint param_id, const char *param_channel, bool is_rli_fake);
-  virtual ~Relay_log_info();
+  ~Relay_log_info() override;
 
   /*
     Determines if a warning message on unsafe execution was
@@ -1652,7 +1746,7 @@ class Relay_log_info : public Rpl_info {
     mysql_mutex_unlock(&data_lock);
   }
 
-  bool set_info_search_keys(Rpl_info_handler *to);
+  bool set_info_search_keys(Rpl_info_handler *to) override;
 
   /**
     Get coordinator's RLI. Especially used get the rli from
@@ -1661,7 +1755,7 @@ class Relay_log_info : public Rpl_info {
   */
   virtual Relay_log_info *get_c_rli() { return this; }
 
-  virtual const char *get_for_channel_str(bool upper_case = false) const;
+  const char *get_for_channel_str(bool upper_case = false) const override;
 
   /**
     Set replication filter for the channel.
@@ -1762,14 +1856,36 @@ class Relay_log_info : public Rpl_info {
   static const int LINES_IN_RELAY_LOG_INFO_WITH_REQUIRE_ROW_FORMAT = 11;
 
   /*
+    Represents line number in relay_log.info to save
+    REQUIRE_TABLE_PRIMARY_KEY_CHECK
+  */
+  static const int
+      LINES_IN_RELAY_LOG_INFO_WITH_REQUIRE_TABLE_PRIMARY_KEY_CHECK = 12;
+
+  /*
+    Represent line number in relay_log.info to save
+    ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_TYPE.
+  */
+  static const int
+      LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_TYPE =
+          13;
+
+  /*
+    Represent line number in relay_log.info to save
+    ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_VALUE.
+  */
+  static const int
+      LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_VALUE =
+          14;
+  /*
     Total lines in relay_log.info.
     This has to be updated every time a member is added or removed.
   */
   static const int MAXIMUM_LINES_IN_RELAY_LOG_INFO_FILE =
-      LINES_IN_RELAY_LOG_INFO_WITH_REQUIRE_ROW_FORMAT;
+      LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_VALUE;
 
-  bool read_info(Rpl_info_handler *from);
-  bool write_info(Rpl_info_handler *to);
+  bool read_info(Rpl_info_handler *from) override;
+  bool write_info(Rpl_info_handler *to) override;
 
   Relay_log_info(const Relay_log_info &info);
   Relay_log_info &operator=(const Relay_log_info &info);
@@ -1811,6 +1927,18 @@ class Relay_log_info : public Rpl_info {
   */
   int thd_tx_priority;
 
+  /**
+    If the SQL thread should or not ignore the set limit for
+    write set collection
+   */
+  bool m_ignore_write_set_memory_limit;
+
+  /**
+    Even if a component says all transactions require write sets,
+    this variable says the SQL thread transactions can drop them
+  */
+  bool m_allow_drop_write_set;
+
   /* The object stores and handles START SLAVE UNTIL option */
   Until_option *until_option;
 
@@ -1824,7 +1952,7 @@ class Relay_log_info : public Rpl_info {
     at internal rollback of the slave applier at the same time with
     the engine ha_data re-attachment.
   */
-  bool is_engine_ha_data_detached;
+  bool m_is_engine_ha_data_detached;
   /**
     Reference to being applied event. The member is set at event reading
     and gets reset at the end of the event lifetime.
@@ -1846,6 +1974,20 @@ class Relay_log_info : public Rpl_info {
   void set_thd_tx_priority(int priority) { thd_tx_priority = priority; }
 
   int get_thd_tx_priority() { return thd_tx_priority; }
+
+  void set_ignore_write_set_memory_limit(bool ignore_limit) {
+    m_ignore_write_set_memory_limit = ignore_limit;
+  }
+
+  bool get_ignore_write_set_memory_limit() {
+    return m_ignore_write_set_memory_limit;
+  }
+
+  void set_allow_drop_write_set(bool does_not_require_ws) {
+    m_allow_drop_write_set = does_not_require_ws;
+  }
+
+  bool get_allow_drop_write_set() { return m_allow_drop_write_set; }
 
   const char *get_until_log_name();
   my_off_t get_until_log_pos();
@@ -1875,7 +2017,7 @@ class Relay_log_info : public Rpl_info {
 
   /**
     Detaches the engine ha_data from THD. The fact
-    is memorized in @c is_engine_ha_detached flag.
+    is memorized in @c m_is_engine_ha_data_detached flag.
 
     @param  thd a reference to THD
   */
@@ -1884,29 +2026,19 @@ class Relay_log_info : public Rpl_info {
 
   /**
     Reattaches the engine ha_data to THD. The fact
-    is memorized in @c is_engine_ha_detached flag.
+    is memorized in @c m_is_engine_ha_data_detached flag.
 
     @param  thd a reference to THD
   */
 
   void reattach_engine_ha_data(THD *thd);
+
   /**
-    Drops the engine ha_data flag when it is up.
-    The method is run at execution points of the engine ha_data
-    re-attachment.
-
-    @return true   when THD has detached the engine ha_data,
-            false  otherwise
+    Checks whether engine ha data is detached from THD
+    @retval true if the data is detached
+    @retval false if the data is not detached
   */
-
-  bool unflag_detached_engine_ha_data() {
-    bool rc = false;
-
-    if (is_engine_ha_data_detached)
-      rc = !(is_engine_ha_data_detached = false);  // return the old value
-
-    return rc;
-  }
+  bool is_engine_ha_data_detached() { return m_is_engine_ha_data_detached; }
 
   /**
     Execute actions at replicated atomic DLL post rollback time.
@@ -2201,7 +2333,7 @@ class Applier_security_context_guard {
    */
   virtual ~Applier_security_context_guard();
 
-  //--> Deleted constructors and methods to remove default move/copy semantics
+  // --> Deleted constructors and methods to remove default move/copy semantics
   Applier_security_context_guard(const Applier_security_context_guard &) =
       delete;
   Applier_security_context_guard(Applier_security_context_guard &&) = delete;
@@ -2209,7 +2341,7 @@ class Applier_security_context_guard {
       const Applier_security_context_guard &) = delete;
   Applier_security_context_guard &operator=(Applier_security_context_guard &&) =
       delete;
-  //<--
+  // <--
 
   /**
     Returns whether or not privilege checks may be skipped within the current

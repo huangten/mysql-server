@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -196,7 +196,7 @@ class NdbTableImpl : public NdbDictionary::Table, public NdbDictObjectImpl {
 public:
   NdbTableImpl();
   NdbTableImpl(NdbDictionary::Table &);
-  ~NdbTableImpl();
+  ~NdbTableImpl() override;
   
   static SimpleProperties::IndirectReader IndirectReader;
   static SimpleProperties::IndirectWriter IndirectWriter;
@@ -366,7 +366,7 @@ class NdbIndexImpl : public NdbDictionary::Index, public NdbDictObjectImpl {
 public:
   NdbIndexImpl();
   NdbIndexImpl(NdbDictionary::Index &);
-  ~NdbIndexImpl();
+  ~NdbIndexImpl() override;
 
   void init();
   int setName(const char * name);
@@ -469,7 +469,7 @@ class NdbEventImpl : public NdbDictionary::Event, public NdbDictObjectImpl {
 public:
   NdbEventImpl();
   NdbEventImpl(NdbDictionary::Event &);
-  ~NdbEventImpl();
+  ~NdbEventImpl() override;
 
   void init();
   int setName(const char * name);
@@ -539,7 +539,7 @@ class NdbTablespaceImpl : public NdbDictionary::Tablespace,
 public:
   NdbTablespaceImpl();
   NdbTablespaceImpl(NdbDictionary::Tablespace &);
-  ~NdbTablespaceImpl();
+  ~NdbTablespaceImpl() override;
 
   int assign(const NdbTablespaceImpl&);
 
@@ -553,7 +553,7 @@ class NdbLogfileGroupImpl : public NdbDictionary::LogfileGroup,
 public:
   NdbLogfileGroupImpl();
   NdbLogfileGroupImpl(NdbDictionary::LogfileGroup &);
-  ~NdbLogfileGroupImpl();
+  ~NdbLogfileGroupImpl() override;
 
   int assign(const NdbLogfileGroupImpl&);
 
@@ -578,7 +578,7 @@ class NdbDatafileImpl : public NdbDictionary::Datafile, public NdbFileImpl {
 public:
   NdbDatafileImpl();
   NdbDatafileImpl(NdbDictionary::Datafile &);
-  ~NdbDatafileImpl();
+  ~NdbDatafileImpl() override;
 
   int assign(const NdbDatafileImpl&);
 
@@ -591,7 +591,7 @@ class NdbUndofileImpl : public NdbDictionary::Undofile, public NdbFileImpl {
 public:
   NdbUndofileImpl();
   NdbUndofileImpl(NdbDictionary::Undofile &);
-  ~NdbUndofileImpl();
+  ~NdbUndofileImpl() override;
 
   int assign(const NdbUndofileImpl&);
 
@@ -605,7 +605,7 @@ class NdbHashMapImpl : public NdbDictionary::HashMap, public NdbDictObjectImpl
 public:
   NdbHashMapImpl();
   NdbHashMapImpl(NdbDictionary::HashMap &);
-  ~NdbHashMapImpl();
+  ~NdbHashMapImpl() override;
 
   int assign(const NdbHashMapImpl& src);
 
@@ -630,7 +630,7 @@ class NdbForeignKeyImpl : public NdbDictionary::ForeignKey,
 public:
   NdbForeignKeyImpl();
   NdbForeignKeyImpl(NdbDictionary::ForeignKey &);
-  ~NdbForeignKeyImpl();
+  ~NdbForeignKeyImpl() override;
 
   void init();
   int assign(const NdbForeignKeyImpl& src);
@@ -1373,7 +1373,7 @@ public:
   InitTable(const BaseString &name) :
     GlobalCacheInitObject(name)
   {}
-  int init(NdbDictionaryImpl *dict, NdbTableImpl &tab) const
+  int init(NdbDictionaryImpl *dict, NdbTableImpl &tab) const override
   {
     int res= dict->getBlobTables(tab);
     if (res == 0)
@@ -1438,7 +1438,7 @@ NdbDictionaryImpl::get_local_table_info(const BaseString& internalTableName)
   DBUG_ENTER("NdbDictionaryImpl::get_local_table_info");
   DBUG_PRINT("enter", ("table: %s", internalTableName.c_str()));
 
-  Ndb_local_table_info *info= m_localHash.get(internalTableName.c_str());
+  Ndb_local_table_info *info= m_localHash.get(internalTableName);
   if (info == 0)
   {
     NdbTableImpl *tab=
@@ -1448,7 +1448,7 @@ NdbDictionaryImpl::get_local_table_info(const BaseString& internalTableName)
       info= Ndb_local_table_info::create(tab, m_local_table_data_size);
       if (info)
       {
-        m_localHash.put(internalTableName.c_str(), info);
+        m_localHash.put(internalTableName, info);
       }
     }
   }
@@ -1469,7 +1469,7 @@ public:
     m_prim(prim)
     {}
   
-  int init(NdbDictionaryImpl *dict, NdbTableImpl &tab) const {
+  int init(NdbDictionaryImpl *dict, NdbTableImpl &tab) const override {
     DBUG_ENTER("InitIndex::init");
     DBUG_ASSERT(tab.m_indexType != NdbDictionary::Object::TypeUndefined);
     /**
@@ -1630,7 +1630,7 @@ NdbDictionaryImpl::getIndex(const char* index_name,
   const BaseString
     internal_indexname(m_ndb.internalize_index_name(&prim, index_name));
 
-  Ndb_local_table_info *info= m_localHash.get(internal_indexname.c_str());
+  Ndb_local_table_info *info= m_localHash.get(internal_indexname);
   NdbTableImpl *tab;
   if (info == 0)
   {
@@ -1643,7 +1643,7 @@ NdbDictionaryImpl::getIndex(const char* index_name,
     info= Ndb_local_table_info::create(tab, 0);
     if (!info)
       goto retry;
-    m_localHash.put(internal_indexname.c_str(), info);
+    m_localHash.put(internal_indexname, info);
   }
   else
     tab= info->m_table_impl;
@@ -1655,7 +1655,7 @@ retry:
   const BaseString
     old_internal_indexname(m_ndb.old_internalize_index_name(&prim, index_name));
 
-  info= m_localHash.get(old_internal_indexname.c_str());
+  info= m_localHash.get(old_internal_indexname);
   if (info == 0)
   {
     tab= fetchGlobalTableImplRef(InitIndex(old_internal_indexname,
@@ -1667,7 +1667,7 @@ retry:
     info= Ndb_local_table_info::create(tab, 0);
     if (!info)
       goto err;
-    m_localHash.put(old_internal_indexname.c_str(), info);
+    m_localHash.put(old_internal_indexname, info);
   }
   else
     tab= info->m_table_impl;

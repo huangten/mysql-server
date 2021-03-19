@@ -2,7 +2,7 @@
 #define PARTITION_HANDLER_INCLUDED
 
 /*
-   Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -102,7 +102,7 @@ void partitioning_init();
 class Partition_share : public Handler_share {
  public:
   Partition_share();
-  ~Partition_share();
+  ~Partition_share() override;
 
   /** Set if auto increment is used an initialized. */
   bool auto_inc_initialized;
@@ -350,7 +350,7 @@ class Partition_handler {
 
     @return handler or NULL if not supported.
   */
-  virtual handler *get_handler() { return NULL; }
+  virtual handler *get_handler() { return nullptr; }
 };
 
 /// Maps compare function to strict weak ordering required by Priority_queue.
@@ -416,7 +416,7 @@ class Partition_helper {
   */
   bool init_partitioning(MEM_ROOT *mem_root MY_ATTRIBUTE((unused))) {
 #ifndef DBUG_OFF
-    m_key_not_found_partitions.bitmap = NULL;
+    m_key_not_found_partitions.bitmap = nullptr;
 #endif
     return false;
   }
@@ -429,12 +429,9 @@ class Partition_helper {
 
   /**
     Insert a row to the partitioned table.
-
-    @param buf The row in MySQL Row Format.
-
-    @return Operation status.
-      @retval    0 Success
-      @retval != 0 Error code
+      @returns Operation status.
+      @returns    0 Success
+      @returns != 0 Error code
   */
   int ph_write_row(uchar *buf);
   /**
@@ -452,12 +449,9 @@ class Partition_helper {
     new_data is always record[0]
     old_data is always record[1]
 
-    @param old_data  The old record in MySQL Row Format.
-    @param new_data  The new record in MySQL Row Format.
-
     @return Operation status.
-      @retval    0 Success
-      @retval != 0 Error code
+      @returns    0 Success
+      @returns != 0 Error code
   */
   int ph_update_row(const uchar *old_data, uchar *new_data);
   /**
@@ -624,8 +618,8 @@ class Partition_helper {
     Set m_part_share, Allocate internal bitmaps etc. used by open tables.
 
     @return Operation status.
-      @retval false success.
-      @retval true  failure.
+      @returns false success.
+      @returns true  failure.
   */
   bool open_partitioning(Partition_share *part_share);
   /**
@@ -654,17 +648,25 @@ class Partition_helper {
       m_auto_increment_lock = false;
     }
   }
+
   /**
-    Get auto increment.
+    Get a range of auto increment values.
 
-    Only to be used for auto increment values that are the first field in
-    an unique index.
+    Can only be used if the auto increment field is the first field in an index.
 
-    @param[in]  increment           Increment between generated numbers.
-    @param[in]  nb_desired_values   Number of values requested.
-    @param[out] first_value         First reserved value (ULLONG_MAX on error).
-    @param[out] nb_reserved_values  Number of values reserved.
-  */
+    This method is called by update_auto_increment which in turn is called
+    by the individual handlers as part of write_row. We use the
+    part_share->next_auto_inc_val, or search all
+    partitions for the highest auto_increment_value if not initialized or
+    if auto_increment field is a secondary part of a key, we must search
+    every partition when holding a mutex to be sure of correctness.
+
+    @param[in]   increment           Increment value.
+    @param[in]   nb_desired_values   Number of desired values.
+    @param[out]  first_value         First auto inc value reserved
+                                        or MAX if failure.
+    @param[out]  nb_reserved_values  Number of values reserved.
+   */
   void get_auto_increment_first_field(ulonglong increment,
                                       ulonglong nb_desired_values,
                                       ulonglong *first_value,
@@ -932,17 +934,9 @@ class Partition_helper {
     If we need to scan only one partition, set m_ordered_scan_ongoing=false
     as we will not need to do merge ordering.
 
-    @param buf            Buffer to later return record in (this function
-                          needs it to calculate partitioning function values)
-
-    @param idx_read_flag  True <=> m_start_key has range start endpoint which
-                          probably can be used to determine the set of
-                          partitions to scan.
-                          False <=> there is no start endpoint.
-
     @return Operation status.
-      @retval   0  Success
-      @retval !=0  Error code
+      @returns   0  Success
+      @returns !=0  Error code
   */
   int partition_scan_set_up(uchar *buf, bool idx_read_flag);
   /**
@@ -956,13 +950,10 @@ class Partition_helper {
     scan is performed on only one partition and thus it isn't necessary to
     perform any sort.
 
-    @param[out] buf        Read row in MySQL Row Format.
-    @param[in]  is_next_same  Called from index_next_same.
-
     @return Operation status.
-      @retval HA_ERR_END_OF_FILE  End of scan
-      @retval 0                   Success
-      @retval other               Error code
+      @returns HA_ERR_END_OF_FILE  End of scan
+      @returns 0                   Success
+      @returns other               Error code
   */
   int handle_unordered_next(uchar *buf, bool is_next_same);
   /**
@@ -982,13 +973,12 @@ class Partition_helper {
   /**
     Common routine to start index scan with ordered results.
 
-    @param[out] buf  Read row in MySQL Row Format
 
-    @return Operation status
-      @retval HA_ERR_END_OF_FILE    End of scan
-      @retval HA_ERR_KEY_NOT_FOUND  End of scan
-      @retval 0                     Success
-      @retval other                 Error code
+      @returns Operation status
+      @returns HA_ERR_END_OF_FILE    End of scan
+      @returns HA_ERR_KEY_NOT_FOUND  End of scan
+      @returns 0                     Success
+      @returns other                 Error code
   */
   int handle_ordered_index_scan(uchar *buf);
   /**
@@ -998,10 +988,10 @@ class Partition_helper {
     ha_index_read_map was done, those partitions must be included in the
     following index_next/prev call.
 
-    @return Operation status
-      @retval HA_ERR_END_OF_FILE    End of scan
-      @retval 0                     Success
-      @retval other                 Error code
+      @returns Operation status
+      @returns HA_ERR_END_OF_FILE    End of scan
+      @returns 0                     Success
+      @returns other                 Error code
   */
   int handle_ordered_index_scan_key_not_found();
   /**
@@ -1045,7 +1035,18 @@ class Partition_helper {
       @retval HA_ERR_KEY_NOT_FOUND Record not found, but index cursor
     positioned.
       @retval other                Error code.
-  */
+
+    @details
+      Start scanning the range (when invoked from read_range_first()) or doing
+      an index lookup (when invoked from index_read_XXX):
+       - If possible, perform partition selection
+       - Find the set of partitions we're going to use
+       - Depending on whether we need ordering:
+          NO:  Get the first record from first used partition (see
+               handle_unordered_scan_next_partition)
+          YES: Fill the priority queue and get the record that is the first in
+               the ordering
+   */
   int common_index_read(uchar *buf, bool have_start_key);
   /**
     Common routine for index_first/index_last.

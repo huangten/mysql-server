@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -22,7 +22,7 @@
 
 #include "sql/parse_tree_items.h"
 
-#include <sys/types.h>
+#include <sys/types.h>  // TODO: replace with cstdint
 
 #include "m_string.h"
 #include "my_dbug.h"
@@ -35,6 +35,7 @@
 #include "sql/auth/auth_acls.h"
 #include "sql/item_cmpfunc.h"  // Item_func_eq
 #include "sql/item_create.h"
+#include "sql/item_subselect.h"
 #include "sql/mysqld.h"  // using_udf_functions
 #include "sql/parse_tree_nodes.h"
 #include "sql/protocol.h"
@@ -161,25 +162,13 @@ static Item *handle_sql2003_note184_exception(Parse_context *pc, Item *left,
   return result;
 }
 
-bool PTI_table_wild::itemize(Parse_context *pc, Item **item) {
-  if (super::itemize(pc, item)) return true;
-
-  schema = pc->thd->get_protocol()->has_client_capability(CLIENT_NO_SCHEMA)
-               ? nullptr
-               : schema;
-  *item = new (pc->mem_root) Item_field(POS(), schema, table, "*");
-  if (*item == NULL || (*item)->itemize(pc, item)) return true;
-  pc->select->with_wild++;
-  return false;
-}
-
 bool PTI_comp_op::itemize(Parse_context *pc, Item **res) {
   if (super::itemize(pc, res) || left->itemize(pc, &left) ||
       right->itemize(pc, &right))
     return true;
 
   *res = (*boolfunc2creator)(false)->create(left, right);
-  return *res == NULL;
+  return *res == nullptr;
 }
 
 bool PTI_comp_op_all::itemize(Parse_context *pc, Item **res) {
@@ -210,7 +199,7 @@ bool PTI_function_call_nonkeyword_sysdate::itemize(Parse_context *pc,
     *res = new (pc->mem_root) Item_func_sysdate_local(dec);
   else
     *res = new (pc->mem_root) Item_func_now_local(dec);
-  if (*res == NULL) return true;
+  if (*res == nullptr) return true;
   lex->safe_to_cache_query = false;
 
   return false;
@@ -246,7 +235,7 @@ bool PTI_function_call_generic_ident_sys::itemize(Parse_context *pc,
   if (super::itemize(pc, res)) return true;
 
   THD *thd = pc->thd;
-  udf = 0;
+  udf = nullptr;
   if (using_udf_functions && (udf = find_udf(ident.str, ident.length)) &&
       udf->type == UDFTYPE_AGGREGATE) {
     pc->select->in_sum_expr++;
@@ -279,7 +268,7 @@ bool PTI_function_call_generic_ident_sys::itemize(Parse_context *pc,
       *res = builder->create_func(thd, ident, opt_udf_expr_list);
     }
   }
-  return *res == NULL || (*res)->itemize(pc, res);
+  return *res == nullptr || (*res)->itemize(pc, res);
 }
 
 bool PTI_function_call_generic_2d::itemize(Parse_context *pc, Item **res) {
@@ -307,7 +296,7 @@ bool PTI_function_call_generic_2d::itemize(Parse_context *pc, Item **res) {
   Create_qfunc *builder = find_qualified_function_builder(pc->thd);
   DBUG_ASSERT(builder);
   *res = builder->create(pc->thd, db, func, true, opt_expr_list);
-  return *res == NULL || (*res)->itemize(pc, res);
+  return *res == nullptr || (*res)->itemize(pc, res);
 }
 
 bool PTI_text_literal_nchar_string::itemize(Parse_context *pc, Item **res) {
@@ -323,13 +312,14 @@ bool PTI_text_literal_nchar_string::itemize(Parse_context *pc, Item **res) {
 bool PTI_singlerow_subselect::itemize(Parse_context *pc, Item **res) {
   if (super::itemize(pc, res) || subselect->contextualize(pc)) return true;
   *res = new (pc->mem_root) Item_singlerow_subselect(subselect->value());
-  return *res == NULL;
+  pc->select->n_scalar_subqueries++;
+  return *res == nullptr;
 }
 
 bool PTI_exists_subselect::itemize(Parse_context *pc, Item **res) {
   if (super::itemize(pc, res) || subselect->contextualize(pc)) return true;
   *res = new (pc->mem_root) Item_exists_subselect(subselect->value());
-  return *res == NULL;
+  return *res == nullptr;
 }
 
 bool PTI_handle_sql2003_note184_exception::itemize(Parse_context *pc,
@@ -338,7 +328,7 @@ bool PTI_handle_sql2003_note184_exception::itemize(Parse_context *pc,
       right->itemize(pc, &right))
     return true;
   *res = handle_sql2003_note184_exception(pc, left, is_negation, right);
-  return *res == NULL;
+  return *res == nullptr;
 }
 
 bool PTI_expr_with_alias::itemize(Parse_context *pc, Item **res) {
@@ -389,9 +379,9 @@ bool PTI_simple_ident_ident::itemize(Parse_context *pc, Item **res) {
     } else {
       *res = new (pc->mem_root) Item_ref(POS(), NullS, NullS, ident.str);
     }
-    if (*res == NULL || (*res)->itemize(pc, res)) return true;
+    if (*res == nullptr || (*res)->itemize(pc, res)) return true;
   }
-  return *res == NULL;
+  return *res == nullptr;
 }
 
 bool PTI_simple_ident_q_3d::itemize(Parse_context *pc, Item **res) {
@@ -448,7 +438,8 @@ bool PTI_simple_ident_q_2d::itemize(Parse_context *pc, Item **res) {
     Item_trigger_field *trg_fld = new (pc->mem_root)
         Item_trigger_field(POS(), new_row ? TRG_NEW_ROW : TRG_OLD_ROW, field,
                            SELECT_ACL, read_only);
-    if (trg_fld == NULL || trg_fld->itemize(pc, (Item **)&trg_fld)) return true;
+    if (trg_fld == nullptr || trg_fld->itemize(pc, (Item **)&trg_fld))
+      return true;
     DBUG_ASSERT(trg_fld->type() == TRIGGER_FIELD_ITEM);
 
     /*
@@ -550,7 +541,7 @@ bool PTI_variable_aux_set_var::itemize(Parse_context *pc, Item **res) {
   return lex->set_var_list.push_back(this);
 }
 
-bool PTI_variable_aux_ident_or_text::itemize(Parse_context *pc, Item **res) {
+bool PTI_user_variable::itemize(Parse_context *pc, Item **res) {
   if (super::itemize(pc, res)) return true;
 
   LEX *lex = pc->thd->lex;
@@ -664,27 +655,34 @@ bool PTI_odbc_date::itemize(Parse_context *pc, Item **res) {
   return false;
 }
 
-bool PTI_limit_option_ident::itemize(Parse_context *pc, Item **res) {
-  if (super::itemize(pc, res)) return true;
+bool PTI_int_splocal::itemize(Parse_context *pc, Item **res) {
+  if (super::itemize(pc, res)) return true;  // OOM
 
-  LEX *lex = pc->thd->lex;
-  sp_head *sp = lex->sphead;
+  LEX *const lex = pc->thd->lex;
+  sp_head *const sp = lex->sphead;
   const char *query_start_ptr =
       sp ? sp->m_parser_data.get_current_stmt_start_ptr() : nullptr;
 
-  Item_splocal *v = create_item_for_sp_var(
-      pc->thd, ident, nullptr, query_start_ptr, ident_loc.start, ident_loc.end);
-  if (v == nullptr) return true;
-
-  lex->safe_to_cache_query = false;
-
+  Item_splocal *v =
+      create_item_for_sp_var(pc->thd, m_name, nullptr, query_start_ptr,
+                             m_location.raw.start, m_location.raw.end);
+  if (v == nullptr) {
+    return true;  // undefined variable or OOM
+  }
   if (v->type() != Item::INT_ITEM) {
-    my_error(ER_WRONG_SPVAR_TYPE_IN_LIMIT, MYF(0));
+    pc->thd->syntax_error_at(m_location, ER_SPVAR_NONINTEGER_TYPE, m_name.str);
     return true;
   }
 
-  v->limit_clause_param = true;
+  lex->safe_to_cache_query = false;
   *res = v;
+  return false;
+}
+
+bool PTI_limit_option_ident::itemize(Parse_context *pc, Item **res) {
+  if (super::itemize(pc, res)) return true;
+  auto *v = down_cast<Item_splocal *>(*res);
+  v->limit_clause_param = true;
   return false;
 }
 
@@ -703,7 +701,6 @@ bool PTI_limit_option_param_marker::itemize(Parse_context *pc, Item **res) {
   */
   DBUG_ASSERT(tmp_param == param_marker);
 
-  param_marker->limit_clause_param = true;
   *res = param_marker;
   return false;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -103,12 +103,16 @@ st_alter_tablespace::st_alter_tablespace(
       undo_buffer_size{opts.undo_buffer_size},
       redo_buffer_size{opts.redo_buffer_size},
       initial_size{opts.initial_size},
-      autoextend_size{opts.autoextend_size},
       max_size{opts.max_size},
       file_block_size{opts.file_block_size},
       nodegroup_id{opts.nodegroup_id},
       wait_until_completed{opts.wait_until_completed},
-      ts_comment{opts.ts_comment.str} {}
+      ts_comment{opts.ts_comment.str},
+      encryption{opts.encryption.str} {
+  if (opts.autoextend_size.has_value()) {
+    autoextend_size = opts.autoextend_size.value();
+  }
+}
 
 bool validate_tablespace_name_length(const char *tablespace_name) {
   DBUG_ASSERT(tablespace_name != nullptr);
@@ -530,6 +534,9 @@ bool Sql_cmd_create_tablespace::execute(THD *thd) {
 
   tablespace->set_comment(dd::String_type{m_options->ts_comment.str, cl});
 
+  if (m_options->engine_attribute.str)
+    tablespace->set_engine_attribute(m_options->engine_attribute);
+
   LEX_STRING tblspc_datafile_name = {m_datafile_name.str,
                                      m_datafile_name.length};
   if (m_auto_generate_datafile_name) {
@@ -552,6 +559,11 @@ bool Sql_cmd_create_tablespace::execute(THD *thd) {
   // Add datafile
   tablespace->add_file()->set_filename(
       dd::make_string_type(tblspc_datafile_name));
+
+  tablespace->options().set("autoextend_size",
+                            m_options->autoextend_size.has_value()
+                                ? m_options->autoextend_size.value()
+                                : 0);
 
   // Write changes to dictionary.
   if (dc.store(tablespace.get())) {
@@ -945,6 +957,15 @@ bool Sql_cmd_alter_tablespace::execute(THD *thd) {
                                     &table_mdl_reqs))
         return true;
     }
+  }
+
+  if (m_options->engine_attribute.str) {
+    tsmp.second->set_engine_attribute(m_options->engine_attribute);
+  }
+
+  if (m_options->autoextend_size.has_value()) {
+    tsmp.second->options().set("autoextend_size",
+                               m_options->autoextend_size.value());
   }
 
   /*

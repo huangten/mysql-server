@@ -1,8 +1,15 @@
+# Performance schema tests generally depend on specific query plans
+# and behavior, and much of the perfschema suite is therefore disabled
+# if the hypergraph optimizer is active.
+--source include/not_hypergraph.inc
+
 # Tests for PERFORMANCE_SCHEMA table io
 #       Show the impact of an index
 
 # Setup
 
+--source include/have_myisam.inc
+--source include/force_myisam_default.inc
 let $engine_type= MyISAM;
 
 --disable_warnings

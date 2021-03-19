@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -38,12 +38,12 @@
 #include "my_sqlcommand.h"
 #include "my_systime.h"
 #include "my_thread.h"
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/components/services/psi_stage_bits.h"
 #include "mysql/plugin.h"
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_file.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysql/service_thd_wait.h"
 #include "mysql_com.h"
@@ -87,18 +87,22 @@ using std::min;
   what follows. For now, this is just used to get the number of
   fields.
 */
-const char *info_rli_fields[] = {"number_of_lines",
-                                 "group_relay_log_name",
-                                 "group_relay_log_pos",
-                                 "group_master_log_name",
-                                 "group_master_log_pos",
-                                 "sql_delay",
-                                 "number_of_workers",
-                                 "id",
-                                 "channel_name",
-                                 "privilege_checks_user",
-                                 "privilege_checks_hostname",
-                                 "require_row_format"};
+const char *info_rli_fields[] = {
+    "number_of_lines",
+    "group_relay_log_name",
+    "group_relay_log_pos",
+    "group_master_log_name",
+    "group_master_log_pos",
+    "sql_delay",
+    "number_of_workers",
+    "id",
+    "channel_name",
+    "privilege_checks_user",
+    "privilege_checks_hostname",
+    "require_row_format",
+    "require_table_primary_key_check",
+    "assign_gtids_to_anonymous_transactions_type",
+    "assign_gtids_to_anonymous_transactions_value"};
 
 Relay_log_info::Relay_log_info(bool is_slave_recovery,
 #ifdef HAVE_PSI_INTERFACE
@@ -142,6 +146,7 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery,
       m_privilege_checks_hostname{""},
       m_privilege_checks_user_corrupted{false},
       m_require_row_format(false),
+      m_require_table_primary_key_check(PK_CHECK_STREAM),
       is_group_master_log_pos_invalid(false),
       log_space_total(0),
       ignore_log_space_limit(false),
@@ -187,7 +192,9 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery,
       row_stmt_start_timestamp(0),
       long_find_row_note_printed(false),
       thd_tx_priority(0),
-      is_engine_ha_data_detached(false),
+      m_ignore_write_set_memory_limit(false),
+      m_allow_drop_write_set(false),
+      m_is_engine_ha_data_detached(false),
       current_event(nullptr),
       ddl_not_atomic(false) {
   DBUG_TRACE;
@@ -236,6 +243,14 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery,
     );
     Sid_map *sid_map = new Sid_map(sid_lock);
     gtid_set = new Gtid_set(sid_map, sid_lock);
+
+    /*
+      Group replication applier channel shall not use checksum on its relay
+      log files.
+    */
+    if (channel_map.is_group_replication_channel_name(param_channel, true)) {
+      relay_log.relay_log_checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_OFF;
+    }
   }
   gtid_monitoring_info = new Gtid_monitoring_info();
   do_server_version_split(::server_version, slave_version_split);
@@ -512,7 +527,7 @@ bool Relay_log_info::is_group_relay_log_name_invalid(const char **errmsg) {
   static char errmsg_buff[MYSQL_ERRMSG_SIZE + FN_REFLEN];
   LOG_INFO linfo;
 
-  *errmsg = 0;
+  *errmsg = nullptr;
   if (relay_log.find_log_pos(&linfo, group_relay_log_name, true)) {
     errmsg_fmt =
         "Could not find target log file mentioned in "
@@ -1090,7 +1105,7 @@ int Relay_log_info::purge_relay_logs(THD *thd, const char **errmsg,
         log_index_name = add_channel_to_relay_log_name(
             relay_bin_index_channel, FN_REFLEN, index_file_withoutext);
       } else
-        log_index_name = 0;
+        log_index_name = nullptr;
 
       if (relay_log.open_index_file(log_index_name, ln, true)) {
         LogErr(ERROR_LEVEL, ER_SLAVE_RELAY_LOG_PURGE_FAILED,
@@ -1101,7 +1116,7 @@ int Relay_log_info::purge_relay_logs(THD *thd, const char **errmsg,
       mysql_mutex_lock(&mi->data_lock);
       mysql_mutex_lock(log_lock);
       if (relay_log.open_binlog(
-              ln, 0,
+              ln, nullptr,
               (max_relay_log_size ? max_relay_log_size : max_binlog_size), true,
               true /*need_lock_index=true*/, true /*need_sid_lock=true*/,
               mi->get_mi_description_event())) {
@@ -1312,7 +1327,7 @@ void Relay_log_info::cleanup_context(THD *thd, bool error) {
       xa_trans_force_rollback(thd);
       xid_state->reset();
       cleanup_trans_state(thd);
-      thd->rpl_unflag_detached_engine_ha_data();
+      if (thd->is_engine_ha_data_detached()) thd->rpl_reattach_engine_ha_data();
     }
     thd->mdl_context.release_transactional_locks();
   }
@@ -1433,7 +1448,7 @@ void Relay_log_info::slave_close_thread_tables(THD *thd) {
 */
 bool mysql_show_relaylog_events(THD *thd) {
   Master_info *mi = nullptr;
-  List<Item> field_list;
+  mem_root_deque<Item *> field_list(thd->mem_root);
   bool res;
   DBUG_TRACE;
 
@@ -1448,7 +1463,7 @@ bool mysql_show_relaylog_events(THD *thd) {
   }
 
   Log_event::init_show_field_list(&field_list);
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF)) {
     res = true;
     goto err;
@@ -1503,7 +1518,7 @@ int Relay_log_info::rli_init_info(bool skip_received_gtid_set_recovery) {
   abort_pos_wait = 0;
   log_space_limit = relay_log_space_limit;
   log_space_total = 0;
-  tables_to_lock = 0;
+  tables_to_lock = nullptr;
   tables_to_lock_count = 0;
 
   char pattern[FN_REFLEN];
@@ -1615,7 +1630,7 @@ int Relay_log_info::rli_init_info(bool skip_received_gtid_set_recovery) {
       log_index_name = add_channel_to_relay_log_name(
           relay_bin_index_channel, FN_REFLEN, index_file_withoutext);
     } else
-      log_index_name = 0;
+      log_index_name = nullptr;
 
     if (relay_log.open_index_file(log_index_name, ln, true)) {
       LogErr(ERROR_LEVEL, ER_RPL_OPEN_INDEX_FILE_FAILED);
@@ -1673,8 +1688,9 @@ int Relay_log_info::rli_init_info(bool skip_received_gtid_set_recovery) {
     mysql_mutex_lock(log_lock);
 
     if (relay_log.open_binlog(
-            ln, 0, (max_relay_log_size ? max_relay_log_size : max_binlog_size),
-            true, true /*need_lock_index=true*/, true /*need_sid_lock=true*/,
+            ln, nullptr,
+            (max_relay_log_size ? max_relay_log_size : max_binlog_size), true,
+            true /*need_lock_index=true*/, true /*need_sid_lock=true*/,
             mi->get_mi_description_event())) {
       mysql_mutex_unlock(log_lock);
       LogErr(ERROR_LEVEL, ER_RPL_CANT_OPEN_LOG_IN_RLI_INIT_INFO);
@@ -1710,12 +1726,16 @@ int Relay_log_info::rli_init_info(bool skip_received_gtid_set_recovery) {
       goto err;
     }
 
-    if (clone_startup) {
+    /*
+      Clone required cleanup must be done only once, thence we only
+      do it when server is booting.
+    */
+    if (clone_startup && get_server_state() == SERVER_BOOTING) {
       char *channel_name =
           (const_cast<Relay_log_info *>(mi->rli))->get_channel();
-      bool is_group_replication_applier_channel =
+      bool is_group_replication_channel =
           channel_map.is_group_replication_channel_name(channel_name);
-      if (is_group_replication_applier_channel) {
+      if (is_group_replication_channel) {
         if (clear_info()) {
           msg =
               "Error cleaning relay log configuration for group replication "
@@ -1971,6 +1991,10 @@ bool Relay_log_info::clear_info() {
 
   if (this->handler->set_info(this->m_require_row_format)) return true;
 
+  if (DBUG_EVALUATE_IF("rpl_rli_clear_info_error", true, false) ||
+      this->handler->set_info((ulong)this->m_require_table_primary_key_check))
+    return true;
+
   if (this->handler->flush_info(true)) return true;
 
   this->group_relay_log_name[0] = '\0';
@@ -2010,6 +2034,9 @@ bool Relay_log_info::read_info(Rpl_info_handler *from) {
   int temp_sql_delay = 0;
   int temp_internal_id = internal_id;
   int temp_require_row_format = 0;
+  auto temp_assign_gtids_to_anonymous_transactions =
+      Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_OFF;
+  ulong temp_require_table_primary_key_check = Relay_log_info::PK_CHECK_STREAM;
   Rpl_info_handler::enum_field_get_status status{
       Rpl_info_handler::enum_field_get_status::FAILURE};
 
@@ -2139,6 +2166,71 @@ bool Relay_log_info::read_info(Rpl_info_handler *from) {
   }
   m_require_row_format = temp_require_row_format;
 
+  if (lines >= LINES_IN_RELAY_LOG_INFO_WITH_REQUIRE_TABLE_PRIMARY_KEY_CHECK) {
+    if (!!from->get_info(&temp_require_table_primary_key_check, 1)) return true;
+  }
+  if (temp_require_table_primary_key_check < PK_CHECK_STREAM ||
+      temp_require_table_primary_key_check > Relay_log_info::PK_CHECK_OFF)
+    return true;
+  m_require_table_primary_key_check =
+      static_cast<Relay_log_info::enum_require_table_primary_key>(
+          temp_require_table_primary_key_check);
+
+  if (lines >=
+      LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_TYPE) {
+    const ulong off = static_cast<ulong>(
+        Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_OFF);
+    const ulong manual = static_cast<ulong>(
+        Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_UUID);
+
+    ulong long_assign_gtids_to_anonymous_transactions = off;
+
+    if (!!from->get_info((&long_assign_gtids_to_anonymous_transactions), 1))
+      return true;
+
+    if (long_assign_gtids_to_anonymous_transactions < off ||
+        long_assign_gtids_to_anonymous_transactions > manual)
+      return true;
+
+    temp_assign_gtids_to_anonymous_transactions =
+        static_cast<Assign_gtids_to_anonymous_transactions_info::enum_type>(
+            long_assign_gtids_to_anonymous_transactions);
+  }
+
+  if (lines >=
+      LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_VALUE) {
+    char temp_assign_gtids_to_anonymous_transactions_value
+        [binary_log::Uuid::TEXT_LENGTH + 1] = {0};
+    status = from->get_info(temp_assign_gtids_to_anonymous_transactions_value,
+                            binary_log::Uuid::TEXT_LENGTH + 1, "");
+    if (status == Rpl_info_handler::enum_field_get_status::FAILURE) return true;
+
+    if (temp_assign_gtids_to_anonymous_transactions >
+        Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_OFF) {
+      if (status ==
+          Rpl_info_handler::enum_field_get_status::FIELD_VALUE_IS_NULL)
+        return true;
+    } else if (temp_assign_gtids_to_anonymous_transactions ==
+               Assign_gtids_to_anonymous_transactions_info::enum_type::
+                   AGAT_OFF) {
+      if (strcmp(temp_assign_gtids_to_anonymous_transactions_value, ""))
+        return true;
+    }
+    if (m_assign_gtids_to_anonymous_transactions_info.set_info(
+            temp_assign_gtids_to_anonymous_transactions,
+            temp_assign_gtids_to_anonymous_transactions_value)) {
+      LogErr(ERROR_LEVEL, ER_SERVER_WRONG_VALUE_FOR_VAR,
+             "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
+             temp_assign_gtids_to_anonymous_transactions_value);
+      return true;
+    }
+  } else {
+    // If the file contains the TYPE, then the VALUE is mandatory.
+    if (lines >=
+        LINES_IN_RELAY_LOG_INFO_WITH_ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS_TYPE)
+      return true;
+  }
+
   group_relay_log_pos = temp_group_relay_log_pos;
   group_master_log_pos = temp_group_master_log_pos;
   sql_delay = (int32)temp_sql_delay;
@@ -2186,7 +2278,6 @@ bool Relay_log_info::write_info(Rpl_info_handler *to) {
     Relay_log_info::read_info() for details. /Sven
   */
   // DBUG_ASSERT(!belongs_to_client());
-
   if (to->prepare_info_for_write() ||
       to->set_info((int)MAXIMUM_LINES_IN_RELAY_LOG_INFO_FILE) ||
       to->set_info(group_relay_log_name) ||
@@ -2223,6 +2314,19 @@ bool Relay_log_info::write_info(Rpl_info_handler *to) {
   }
 
   if (to->set_info((int)m_require_row_format)) {
+    return true; /* purecov: inspected */
+  }
+
+  if (to->set_info((ulong)m_require_table_primary_key_check)) {
+    return true; /* purecov: inspected */
+  }
+  auto assign_gtids_to_anonymous_transactions =
+      m_assign_gtids_to_anonymous_transactions_info.get_type();
+  if (to->set_info((ulong)assign_gtids_to_anonymous_transactions)) {
+    return true; /* purecov: inspected */
+  }
+  if (to->set_info(
+          m_assign_gtids_to_anonymous_transactions_info.get_value().c_str())) {
     return true; /* purecov: inspected */
   }
   return false;
@@ -2650,7 +2754,7 @@ int Relay_log_info::init_until_option(THD *thd,
 }
 
 void Relay_log_info::detach_engine_ha_data(THD *thd) {
-  is_engine_ha_data_detached = true;
+  m_is_engine_ha_data_detached = true;
   /*
     In case of slave thread applier or processing binlog by client,
     detach the engine ha_data ("native" engine transaction)
@@ -2660,7 +2764,7 @@ void Relay_log_info::detach_engine_ha_data(THD *thd) {
 }
 
 void Relay_log_info::reattach_engine_ha_data(THD *thd) {
-  is_engine_ha_data_detached = false;
+  m_is_engine_ha_data_detached = false;
   /*
     In case of slave thread applier or processing binlog by client,
     reattach the engine ha_data ("native" engine transaction)
@@ -3133,6 +3237,56 @@ bool Relay_log_info::is_row_format_required() const {
 void Relay_log_info::set_require_row_format(bool require_row) {
   DBUG_TRACE;
   this->m_require_row_format = require_row;
+}
+
+Relay_log_info::enum_require_table_primary_key
+Relay_log_info::get_require_table_primary_key_check() const {
+  return this->m_require_table_primary_key_check;
+}
+
+void Relay_log_info::set_require_table_primary_key_check(
+    Relay_log_info::enum_require_table_primary_key require_pk) {
+  DBUG_TRACE;
+  this->m_require_table_primary_key_check = require_pk;
+}
+
+std::string Assign_gtids_to_anonymous_transactions_info::get_value() const {
+  return m_value;
+}
+
+Assign_gtids_to_anonymous_transactions_info::enum_type
+Assign_gtids_to_anonymous_transactions_info::get_type() const {
+  return m_type;
+}
+
+bool Assign_gtids_to_anonymous_transactions_info::set_info(
+    enum_type type_arg, const char *value_arg) {
+  m_type = type_arg;
+  switch (m_type) {
+    case Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_LOCAL:
+      m_value.assign(::server_uuid);
+      m_sidno = gtid_state->get_server_sidno();
+      break;
+    case Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_UUID:
+      DBUG_ASSERT(value_arg != nullptr);
+      rpl_sid rename_sid;
+      if (rename_sid.parse(value_arg, strlen(value_arg))) {
+        return true;
+      }
+      global_sid_lock->rdlock();
+      m_sidno = global_sid_map->add_sid(rename_sid);
+      global_sid_lock->unlock();
+      char normalized_uuid[binary_log::Uuid::TEXT_LENGTH + 1];
+      rename_sid.to_string(normalized_uuid);
+      m_value.assign(normalized_uuid);
+      break;
+    case Assign_gtids_to_anonymous_transactions_info::enum_type::AGAT_OFF:
+      m_value.assign("");
+      break;
+    default:
+      DBUG_ASSERT(0);
+  }
+  return false;
 }
 
 MDL_lock_guard::MDL_lock_guard(THD *target) : m_target{target} { DBUG_TRACE; }

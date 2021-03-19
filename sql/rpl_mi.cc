@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -100,8 +100,11 @@ enum {
   /* line for tls_ciphersuites */
   LINE_FOR_TLS_CIPHERSUITES = 31,
 
+  /* line for source_connection_auto_failover */
+  LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER = 32,
+
   /* Number of lines currently used when saving master info file */
-  LINES_IN_MASTER_INFO = LINE_FOR_TLS_CIPHERSUITES
+  LINES_IN_MASTER_INFO = LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER
 
 };
 
@@ -140,7 +143,8 @@ const char *info_mi_fields[] = {"number_of_lines",
                                 "network_namespace",
                                 "master_compression_algorithm",
                                 "master_zstd_compression_level",
-                                "tls_ciphersuites"};
+                                "tls_ciphersuites",
+                                "source_connection_auto_failover"};
 
 const uint info_mi_table_pk_field_indexes[] = {
     LINE_FOR_CHANNEL - 1,
@@ -493,9 +497,9 @@ bool Master_info::read_info(Rpl_info_handler *from) {
     lines = 7;
 
   if (!!from->get_info(&temp_master_log_pos, (ulong)BIN_LOG_HEADER_SIZE) ||
-      !!from->get_info(host, sizeof(host), (char *)0) ||
-      !!from->get_info(user, sizeof(user), "test") ||
-      !!from->get_info(password, sizeof(password), (char *)0) ||
+      !!from->get_info(host, sizeof(host), (char *)nullptr) ||
+      !!from->get_info(user, sizeof(user), (char *)nullptr) ||
+      !!from->get_info(password, sizeof(password), (char *)nullptr) ||
       !!from->get_info((int *)&port, (int)MYSQL_PORT) ||
       !!from->get_info((int *)&connect_retry, (int)DEFAULT_CONNECT_RETRY))
     return true;
@@ -508,11 +512,11 @@ bool Master_info::read_info(Rpl_info_handler *from) {
   */
   if (lines >= LINES_IN_MASTER_INFO_WITH_SSL) {
     if (!!from->get_info(&temp_ssl, 0) ||
-        !!from->get_info(ssl_ca, sizeof(ssl_ca), (char *)0) ||
-        !!from->get_info(ssl_capath, sizeof(ssl_capath), (char *)0) ||
-        !!from->get_info(ssl_cert, sizeof(ssl_cert), (char *)0) ||
-        !!from->get_info(ssl_cipher, sizeof(ssl_cipher), (char *)0) ||
-        !!from->get_info(ssl_key, sizeof(ssl_key), (char *)0))
+        !!from->get_info(ssl_ca, sizeof(ssl_ca), (char *)nullptr) ||
+        !!from->get_info(ssl_capath, sizeof(ssl_capath), (char *)nullptr) ||
+        !!from->get_info(ssl_cert, sizeof(ssl_cert), (char *)nullptr) ||
+        !!from->get_info(ssl_cipher, sizeof(ssl_cipher), (char *)nullptr) ||
+        !!from->get_info(ssl_key, sizeof(ssl_key), (char *)nullptr))
       return true;
   }
 
@@ -549,7 +553,7 @@ bool Master_info::read_info(Rpl_info_handler *from) {
 
   /* Starting from 5.5 the master_uuid may be in the repository. */
   if (lines >= LINE_FOR_MASTER_UUID) {
-    if (!!from->get_info(master_uuid, sizeof(master_uuid), (char *)0))
+    if (!!from->get_info(master_uuid, sizeof(master_uuid), (char *)nullptr))
       return true;
   }
 
@@ -560,8 +564,8 @@ bool Master_info::read_info(Rpl_info_handler *from) {
   }
 
   if (lines >= LINE_FOR_SSL_CRLPATH) {
-    if (!!from->get_info(ssl_crl, sizeof(ssl_crl), (char *)0) ||
-        !!from->get_info(ssl_crlpath, sizeof(ssl_crlpath), (char *)0))
+    if (!!from->get_info(ssl_crl, sizeof(ssl_crl), (char *)nullptr) ||
+        !!from->get_info(ssl_crlpath, sizeof(ssl_crlpath), (char *)nullptr))
       return true;
   }
 
@@ -570,16 +574,18 @@ bool Master_info::read_info(Rpl_info_handler *from) {
   }
 
   if (lines >= LINE_FOR_CHANNEL) {
-    if (!!from->get_info(channel, sizeof(channel), (char *)0)) return true;
+    if (!!from->get_info(channel, sizeof(channel), (char *)nullptr))
+      return true;
   }
 
   if (lines >= LINE_FOR_TLS_VERSION) {
-    if (!!from->get_info(tls_version, sizeof(tls_version), (char *)0))
+    if (!!from->get_info(tls_version, sizeof(tls_version), (char *)nullptr))
       return true;
   }
 
   if (lines >= LINE_FOR_PUBLIC_KEY_PATH) {
-    if (!!from->get_info(public_key_path, sizeof(public_key_path), (char *)0))
+    if (!!from->get_info(public_key_path, sizeof(public_key_path),
+                         (char *)nullptr))
       return true;
   }
 
@@ -589,7 +595,7 @@ bool Master_info::read_info(Rpl_info_handler *from) {
 
   if (lines >= LINE_FOR_NETWORK_NAMESPACE) {
     if (!!from->get_info(network_namespace, sizeof(network_namespace),
-                         (char *)0))
+                         (char *)nullptr))
       return true;
   }
 
@@ -598,10 +604,6 @@ bool Master_info::read_info(Rpl_info_handler *from) {
   master_log_pos = (my_off_t)temp_master_log_pos;
   auto_position = temp_auto_position;
   get_public_key = (bool)temp_get_public_key;
-
-#ifndef HAVE_OPENSSL
-  if (ssl) LogErr(WARNING_LEVEL, ER_RPL_SSL_INFO_IN_MASTER_INFO_IGNORED);
-#endif /* HAVE_OPENSSL */
 
   if (lines >= LINE_FOR_MASTER_COMPRESSION_ALGORITHM) {
     char algorithm_name[COMPRESSION_ALGORITHM_NAME_BUFFER_SIZE];
@@ -653,6 +655,12 @@ bool Master_info::read_info(Rpl_info_handler *from) {
     }
   }
 
+  if (lines >= LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER) {
+    auto temp_source_connection_auto_failover{0};
+    if (!!from->get_info(&temp_source_connection_auto_failover, 0)) return true;
+    m_source_connection_auto_failover = temp_source_connection_auto_failover;
+  }
+
   return false;
 }
 
@@ -691,7 +699,8 @@ bool Master_info::write_info(Rpl_info_handler *to) {
       to->set_info(network_namespace) || to->set_info(compression_algorithm) ||
       to->set_info((int)zstd_compression_level) ||
       to->set_info(tls_ciphersuites.first ? nullptr
-                                          : tls_ciphersuites.second.c_str()))
+                                          : tls_ciphersuites.second.c_str()) ||
+      to->set_info((int)m_source_connection_auto_failover))
     return true;
 
   return false;
@@ -741,6 +750,11 @@ void Master_info::channel_rdlock() {
 void Master_info::channel_wrlock() {
   channel_map.assert_some_lock();
   m_channel_lock->wrlock();
+}
+
+int Master_info::channel_trywrlock() {
+  channel_map.assert_some_lock();
+  return m_channel_lock->trywrlock();
 }
 
 void Master_info::wait_until_no_reference(THD *thd) {

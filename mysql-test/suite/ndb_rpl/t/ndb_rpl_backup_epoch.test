@@ -1,6 +1,6 @@
 --source include/have_multi_ndb.inc
 --source include/have_binlog_format_mixed_or_row.inc
---source include/master-slave.inc
+--source suite/ndb_rpl/ndb_master-slave.inc
 --source suite/ndb/include/backup_restore_setup.inc
 
 --echo Test to show that combination of Backup + Restore and
@@ -83,6 +83,8 @@ select sleep(2);
 --source suite/ndb/t/ndb_backup_nowait_wait.inc
 
 --let $first_backup_id = $the_backup_id
+
+# select sleep(20); # Force second backup to run after all changes
 
 select sleep(2);
 
@@ -185,7 +187,7 @@ while($backup_count)
 
   --disable_result_log
   select @log_rows:=count(1) from test.ticker;
-  select @log_max_val:=max(a) from test.ticker;
+  select @log_max_val:=ifnull(max(a),200) from test.ticker;
   --enable_result_log
 
   --echo Expect 200 when adding backup and log rows

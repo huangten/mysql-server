@@ -1,4 +1,4 @@
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -32,12 +32,6 @@
 
 #include <cmath>
 
-// Definition of static constexpr data members in Create_field.
-constexpr size_t Create_field::TINYBLOB_MAX_SIZE_IN_BYTES;
-constexpr size_t Create_field::BLOB_MAX_SIZE_IN_BYTES;
-constexpr size_t Create_field::MEDIUMBLOB_MAX_SIZE_IN_BYTES;
-constexpr size_t Create_field::LONGBLOB_MAX_SIZE_IN_BYTES;
-
 /**
     Constructs a column definition from an object representing an actual
     column. This is a reverse-engineering procedure that creates a column
@@ -59,17 +53,17 @@ constexpr size_t Create_field::LONGBLOB_MAX_SIZE_IN_BYTES;
 Create_field::Create_field(Field *old_field, Field *orig_field)
     : hidden(old_field->hidden()),
       field_name(old_field->field_name),
-      change(NULL),
+      change(nullptr),
       comment(old_field->comment),
       sql_type(old_field->real_type()),
       decimals(old_field->decimals()),
-      flags(old_field->flags),
+      flags(old_field->all_flags()),
       auto_flags(old_field->auto_flags),
       charset(old_field->charset()),  // May be NULL ptr
       is_explicit_collation(false),
       geom_type(Field::GEOM_GEOMETRY),
       field(old_field),
-      maybe_null(old_field->maybe_null()),
+      is_nullable(old_field->is_nullable()),
       is_zerofill(false),  // Init to avoid UBSAN warnings
       is_unsigned(false),  // Init to avoid UBSAN warnings
       treat_bit_as_char(
@@ -79,6 +73,8 @@ Create_field::Create_field(Field *old_field, Field *orig_field)
       stored_in_db(old_field->stored_in_db),
       m_default_val_expr(old_field->m_default_val_expr),
       is_array(old_field->is_array()),
+      m_engine_attribute(old_field->m_engine_attribute),
+      m_secondary_engine_attribute(old_field->m_secondary_engine_attribute),
       m_max_display_width_in_codepoints(old_field->char_length()) {
   switch (sql_type) {
     case MYSQL_TYPE_TINY_BLOB:
@@ -124,7 +120,7 @@ Create_field::Create_field(Field *old_field, Field *orig_field)
       buffer pointer.
   */
   if (!(flags & (NO_DEFAULT_VALUE_FLAG | BLOB_FLAG)) &&
-      old_field->ptr != nullptr && orig_field != nullptr) {
+      old_field->field_ptr() != nullptr && orig_field != nullptr) {
     bool default_now = false;
     if (real_type_with_now_as_default(sql_type)) {
       // The SQL type of the new field allows a function default:
@@ -189,7 +185,7 @@ bool Create_field::init(
     THD *thd, const char *fld_name, enum_field_types fld_type,
     const char *display_width_in_codepoints, const char *fld_decimals,
     uint fld_type_modifier, Item *fld_default_value, Item *fld_on_update_value,
-    LEX_CSTRING *fld_comment, const char *fld_change,
+    const LEX_CSTRING *fld_comment, const char *fld_change,
     List<String> *fld_interval_list, const CHARSET_INFO *fld_charset,
     bool has_explicit_collation, uint fld_geom_type,
     Value_generator *fld_gcol_info, Value_generator *fld_default_val_expr,
@@ -213,11 +209,11 @@ bool Create_field::init(
     charset = fld_charset;
 
   auto_flags = Field::NONE;
-  maybe_null = !(fld_type_modifier & NOT_NULL_FLAG);
+  is_nullable = !(fld_type_modifier & NOT_NULL_FLAG);
   this->hidden = hidden;
   is_array = is_array_arg;
 
-  if (fld_default_value != NULL &&
+  if (fld_default_value != nullptr &&
       fld_default_value->type() == Item::FUNC_ITEM) {
     // We have a function default for insertions.
     constant_default = nullptr;
@@ -254,7 +250,7 @@ bool Create_field::init(
   change = fld_change;
   interval = nullptr;
   geom_type = static_cast<Field::geometry_type>(fld_geom_type);
-  interval_list.empty();
+  interval_list.clear();
 
   comment = *fld_comment;
   gcol_info = fld_gcol_info;
@@ -352,6 +348,8 @@ bool Create_field::init(
       allowed_type_modifier = AUTO_INCREMENT_FLAG;
       break;
     case MYSQL_TYPE_NULL:
+    case MYSQL_TYPE_INVALID:
+    case MYSQL_TYPE_BOOL:
       break;
     case MYSQL_TYPE_NEWDECIMAL: {
       ulong precision = static_cast<ulong>(m_max_display_width_in_codepoints);
@@ -465,7 +463,7 @@ bool Create_field::init(
       flags |= ZEROFILL_FLAG | UNSIGNED_FLAG;
       /* Fall through */
     case MYSQL_TYPE_TIMESTAMP2:
-      if (display_width_in_codepoints == NULL) {
+      if (display_width_in_codepoints == nullptr) {
         m_max_display_width_in_codepoints =
             MAX_DATETIME_WIDTH + (decimals ? (1 + decimals) : 0);
       } else if (m_max_display_width_in_codepoints != MAX_DATETIME_WIDTH) {
@@ -571,7 +569,8 @@ bool Create_field::init(
 */
 void Create_field::init_for_tmp_table(enum_field_types sql_type_arg,
                                       uint32 length_arg, uint32 decimals_arg,
-                                      bool maybe_null_arg, bool is_unsigned_arg,
+                                      bool is_nullable_arg,
+                                      bool is_unsigned_arg,
                                       uint pack_length_override_arg,
                                       const char *fld_name) {
   DBUG_TRACE;
@@ -580,7 +579,7 @@ void Create_field::init_for_tmp_table(enum_field_types sql_type_arg,
   sql_type = sql_type_arg;
   m_max_display_width_in_codepoints = length_arg;
   auto_flags = Field::NONE;
-  interval = 0;
+  interval = nullptr;
   charset = &my_charset_bin;
   geom_type = Field::GEOM_GEOMETRY;
 
@@ -613,7 +612,7 @@ void Create_field::init_for_tmp_table(enum_field_types sql_type_arg,
       break;
   }
 
-  maybe_null = maybe_null_arg;
+  is_nullable = is_nullable_arg;
 
   is_zerofill = false;
   is_unsigned = is_unsigned_arg;
@@ -654,19 +653,19 @@ size_t Create_field::max_display_width_in_codepoints() const {
     return std::min(max_display_width_in_codepoints,
                     static_cast<size_t>(MAX_FIELD_WIDTH - 1));
   } else if (sql_type == MYSQL_TYPE_TINY_BLOB) {
-    return TINYBLOB_MAX_SIZE_IN_BYTES / charset->mbmaxlen;
+    return Field::MAX_TINY_BLOB_WIDTH / charset->mbmaxlen;
   } else if (sql_type == MYSQL_TYPE_BLOB && !explicit_display_width()) {
     // For BLOB and TEXT, the user can give a display width explicitly in CREATE
     // TABLE (BLOB(25), TEXT(25)) where the expected behavior is that the server
     // will find the smallest possible BLOB/TEXT type that will fit the given
     // display width. If the user has given an explicit display width, return
     // that instead of the max BLOB size.
-    return BLOB_MAX_SIZE_IN_BYTES / charset->mbmaxlen;
+    return Field::MAX_SHORT_BLOB_WIDTH / charset->mbmaxlen;
   } else if (sql_type == MYSQL_TYPE_MEDIUM_BLOB) {
-    return MEDIUMBLOB_MAX_SIZE_IN_BYTES / charset->mbmaxlen;
+    return Field::MAX_MEDIUM_BLOB_WIDTH / charset->mbmaxlen;
   } else if (sql_type == MYSQL_TYPE_LONG_BLOB || sql_type == MYSQL_TYPE_JSON ||
              sql_type == MYSQL_TYPE_GEOMETRY) {
-    return LONGBLOB_MAX_SIZE_IN_BYTES / charset->mbmaxlen;
+    return Field::MAX_LONG_BLOB_WIDTH / charset->mbmaxlen;
   } else {
     return m_max_display_width_in_codepoints;
   }
@@ -686,29 +685,29 @@ size_t Create_field::max_display_width_in_bytes() const {
     // Numeric types, temporal types, YEAR or BIT are never multi-byte.
     return max_display_width_in_codepoints();
   } else if (sql_type == MYSQL_TYPE_TINY_BLOB) {
-    return TINYBLOB_MAX_SIZE_IN_BYTES;
+    return Field::MAX_TINY_BLOB_WIDTH;
   } else if (sql_type == MYSQL_TYPE_BLOB && !explicit_display_width()) {
     // For BLOB and TEXT, the user can give a display width (BLOB(25), TEXT(25))
     // where the expected behavior is that the server will find the smallest
     // possible BLOB/TEXT type that will fit the given display width. If the
     // user has given an explicit display width, return that instead of the
     // max BLOB size.
-    return BLOB_MAX_SIZE_IN_BYTES;
+    return Field::MAX_SHORT_BLOB_WIDTH;
   } else if (sql_type == MYSQL_TYPE_MEDIUM_BLOB) {
-    return MEDIUMBLOB_MAX_SIZE_IN_BYTES;
+    return Field::MAX_MEDIUM_BLOB_WIDTH;
   } else if (sql_type == MYSQL_TYPE_LONG_BLOB || sql_type == MYSQL_TYPE_JSON ||
              sql_type == MYSQL_TYPE_GEOMETRY) {
-    return LONGBLOB_MAX_SIZE_IN_BYTES;
+    return Field::MAX_LONG_BLOB_WIDTH;
   } else {
     // If the user has given a display width to the TEXT type where the display
     // width is 2^32-1, the below computation will exceed
-    // LONGBLOB_MAX_SIZE_IN_BYTES if the character set is multi-byte. So we must
+    // MAX_LONG_BLOB_WIDTH if the character set is multi-byte. So we must
     // ensure that we never return a value greater than
-    // LONGBLOB_MAX_SIZE_IN_BYTES.
+    // MAX_LONG_BLOB_WIDTH.
     std::int64_t display_width = max_display_width_in_codepoints() *
                                  static_cast<std::int64_t>(charset->mbmaxlen);
     return static_cast<size_t>(std::min(
-        display_width, static_cast<std::int64_t>(LONGBLOB_MAX_SIZE_IN_BYTES)));
+        display_width, static_cast<std::int64_t>(Field::MAX_LONG_BLOB_WIDTH)));
   }
 }
 
@@ -725,7 +724,11 @@ size_t Create_field::pack_length(bool dont_override) const {
                                                       : interval->count);
     }
     case MYSQL_TYPE_NEWDECIMAL: {
-      return max_display_width_in_bytes();
+      DBUG_ASSERT(decimals <= DECIMAL_MAX_SCALE);
+      uint precision = my_decimal_length_to_precision(
+          max_display_width_in_bytes(), decimals, (flags & UNSIGNED_FLAG));
+      precision = std::min(precision, static_cast<uint>(DECIMAL_MAX_PRECISION));
+      return my_decimal_get_binary_size(precision, decimals);
     }
     case MYSQL_TYPE_BIT: {
       if (treat_bit_as_char) {
@@ -764,13 +767,6 @@ size_t Create_field::key_length() const {
       }
       return pack_length() + (max_display_width_in_bytes() & 7 ? 1 : 0);
     }
-    case MYSQL_TYPE_NEWDECIMAL: {
-      DBUG_ASSERT(decimals <= DECIMAL_MAX_SCALE);
-      uint precision = my_decimal_length_to_precision(
-          max_display_width_in_bytes(), decimals, (flags & UNSIGNED_FLAG));
-      precision = std::min(precision, static_cast<uint>(DECIMAL_MAX_PRECISION));
-      return my_decimal_get_binary_size(precision, decimals);
-    }
     default: {
       return pack_length(is_array);
     }
@@ -779,4 +775,13 @@ size_t Create_field::key_length() const {
 
 bool is_field_for_functional_index(const Create_field *create_field) {
   return create_field->hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SQL;
+}
+
+bool is_hidden_by_system(const Create_field *create_field) {
+  return create_field->hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SE ||
+         create_field->hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SQL;
+}
+
+bool is_hidden_by_user(const Create_field *create_field) {
+  return create_field->hidden == dd::Column::enum_hidden_type::HT_HIDDEN_USER;
 }

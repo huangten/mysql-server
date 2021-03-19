@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -40,9 +40,9 @@
 
 #include "my_compiler.h"
 #include "my_loglevel.h"
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_mutex.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/psi/psi_memory.h"
 #include "mysql/psi/psi_stage.h"
 #include "mysys/mysys_priv.h"  // IWYU pragma: keep
@@ -79,8 +79,8 @@ PSI_memory_key key_memory_win_handle_info;
 #endif /* _WIN32 */
 
 /* from my_init */
-char *home_dir = 0;
-const char *my_progname = 0;
+char *home_dir = nullptr;
+const char *my_progname = nullptr;
 char curr_dir[FN_REFLEN] = {0}, home_dir_buff[FN_REFLEN] = {0};
 
 ulong my_tmp_file_created = 0;
@@ -162,8 +162,8 @@ int my_umask = 0664, my_umask_dir = 0777;
 ulong my_default_record_cache_size = RECORD_CACHE_SIZE;
 
 /* from my_malloc */
-USED_MEM *my_once_root_block = 0;     /* pointer to first block */
-uint my_once_extra = ONCE_ALLOC_INIT; /* Memory to alloc / block */
+USED_MEM *my_once_root_block = nullptr; /* pointer to first block */
+uint my_once_extra = ONCE_ALLOC_INIT;   /* Memory to alloc / block */
 
 /* from errors.c */
 void (*error_handler_hook)(uint error, const char *str,

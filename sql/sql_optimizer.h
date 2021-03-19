@@ -1,7 +1,7 @@
 #ifndef SQL_OPTIMIZER_INCLUDED
 #define SQL_OPTIMIZER_INCLUDED
 
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -36,23 +36,23 @@
    Only such indexes are involved in range analysis.
 */
 
-#include <string.h>
 #include <sys/types.h>
+
+#include <cstring>
 #include <memory>
 #include <utility>
 
+#include "field_types.h"
 #include "my_alloc.h"
 #include "my_base.h"
 #include "my_dbug.h"
 #include "my_table_map.h"
 #include "sql/field.h"
 #include "sql/item.h"
-#include "sql/item_subselect.h"
 #include "sql/mem_root_array.h"
 #include "sql/opt_explain_format.h"  // Explain_sort_clause
 #include "sql/row_iterator.h"
-#include "sql/sql_array.h"
-#include "sql/sql_executor.h"  // Next_select_func
+#include "sql/sql_executor.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
 #include "sql/sql_opt_exec_shared.h"
@@ -60,14 +60,19 @@
 #include "sql/table.h"
 #include "sql/temp_table_param.h"
 
+enum class Subquery_strategy : int;
 class COND_EQUAL;
+class Item_subselect;
 class Item_sum;
 class Opt_trace_context;
 class THD;
 class Window;
+struct AccessPath;
 struct MYSQL_LOCK;
 
-typedef Bounds_checked_array<Item_null_result *> Item_null_array;
+class Item_equal;
+template <class T>
+class mem_root_deque;
 
 // Key_use has a trivial destructor, no need to run it from Mem_root_array.
 typedef Mem_root_array<Key_use> Key_use_array;
@@ -80,15 +85,6 @@ struct SARGABLE_PARAM {
   uint num_values;  /* number of values in the above array      */
 };
 
-struct ROLLUP {
-  enum State { STATE_NONE, STATE_INITED, STATE_READY };
-  State state;
-  Item_null_array null_items;
-  Ref_item_array *ref_item_arrays;
-  List<Item> *fields_list;  ///< SELECT list
-  List<Item> *all_fields;   ///< Including hidden fields
-};
-
 /**
   Wrapper for ORDER* pointer to trace origins of ORDER list
 
@@ -97,19 +93,6 @@ struct ROLLUP {
   the whole ORDER list.
 */
 class ORDER_with_src {
-  /**
-    Private empty class to implement type-safe NULL assignment
-
-    This private utility class allows us to implement a constructor
-    from NULL and only NULL (or 0 -- this is the same thing) and
-    an assignment operator from NULL.
-    Assignments from other pointers still prohibited since other
-    pointer types are incompatible with the "null" type, and the
-    casting is impossible outside of ORDER_with_src class, since
-    the "null" type is private.
-  */
-  struct null {};
-
  public:
   ORDER *order;  ///< ORDER expression that we are wrapping with this class
   Explain_sort_clause src;  ///< origin of order list
@@ -125,42 +108,10 @@ class ORDER_with_src {
         src(src_arg),
         flags(order_arg ? ESP_EXISTS : ESP_none) {}
 
-  /**
-    Type-safe NULL assignment
-
-    See a commentary for the "null" type above.
-  */
-  ORDER_with_src &operator=(null *) {
-    clean();
-    return *this;
-  }
-
-  /**
-    Type-safe constructor from NULL
-
-    See a commentary for the "null" type above.
-  */
-  ORDER_with_src(null *) { clean(); }
-
-  /**
-    Transparent access to the wrapped order list
-
-    These operators are safe, since we don't do any conversion of
-    ORDER_with_src value, but just an access to the wrapped
-    ORDER pointer value.
-    We can use ORDER_with_src objects instead ORDER pointers in
-    a transparent way without accessor functions.
-
-    @note     This operator also implements safe "operator bool()"
-              functionality.
-  */
-  operator ORDER *() { return order; }
-  operator const ORDER *() const { return order; }
-
-  ORDER *operator->() const { return order; }
+  bool empty() const { return order == nullptr; }
 
   void clean() {
-    order = NULL;
+    order = nullptr;
     src = ESC_none;
     flags = ESP_none;
   }
@@ -176,6 +127,8 @@ class JOIN {
   JOIN(THD *thd_arg, SELECT_LEX *select);
   JOIN(const JOIN &rhs) = delete;
   JOIN &operator=(const JOIN &rhs) = delete;
+
+  ~JOIN() {}
 
   /// Query block that is optimized and executed using this JOIN
   SELECT_LEX *const select_lex;
@@ -210,6 +163,24 @@ class JOIN {
     passing 1st non-const table to filesort(). NULL means no such table exists.
   */
   TABLE *sort_by_table{nullptr};
+
+  // Temporary tables that need to be cleaned up after the query.
+  // Only used for the hypergraph optimizer; the non-hypergraph optimizer
+  // uses QEP_TABs to hold the list of tables (including temporary tables).
+  struct TemporaryTableToCleanup {
+    TABLE *table;
+
+    // Allocated on the MEM_ROOT, but can hold some objects
+    // that allocate on the heap and thus need destruction.
+    Temp_table_param *temp_table_param;
+  };
+  Prealloced_array<TemporaryTableToCleanup, 1> temp_tables{
+      PSI_NOT_INSTRUMENTED};
+
+  // Similarly, sorting iterators that need to be cleaned up after the query.
+  // Only used for the hypergraph optimizer, for the same reason as above.
+  Prealloced_array<AccessPath *, 1> sorting_paths{PSI_NOT_INSTRUMENTED};
+
   /**
     Before plan has been created, "tables" denote number of input tables in the
     query block and "primary_tables" is equal to "tables".
@@ -255,8 +226,6 @@ class JOIN {
     @see make_group_fields, alloc_group_fields, JOIN::exec
   */
   bool streaming_aggregation{false};
-  /// Whether we've seen at least one row already
-  bool seen_first_record{false};
   /// If query contains GROUP BY clause
   bool grouped;
   /// If true, send produced rows using query_result
@@ -312,7 +281,11 @@ class JOIN {
    */
   /******* Join optimization state members end *******/
 
-  Next_select_func first_select;
+  /// A hook that secondary storage engines can use to override the executor
+  /// completely.
+  using Override_executor_func = bool (*)(JOIN *);
+  Override_executor_func override_executor_func = nullptr;
+
   /**
     The cost of best complete join plan found so far during optimization,
     after optimization phase - cost of picked join order (not taking into
@@ -327,24 +300,21 @@ class JOIN {
   double sort_cost{0.0};
   /// Expected cost of windowing;
   double windowing_cost{0.0};
-  List<Item> *fields;
+  mem_root_deque<Item *> *fields;
   List<Cached_item> group_fields{};
   List<Cached_item> group_fields_cache{};
   Item_sum **sum_funcs{nullptr};
-  Item_sum ***sum_funcs_end{nullptr};
   /**
      Describes a temporary table.
      Each tmp table has its own tmp_table_param.
-     The one here has two roles:
-     - is transiently used as a model by create_intermediate_table(), to build
-     the tmp table's own tmp_table_param.
-     - is also used as description of the pseudo-tmp-table of grouping
-     (REF_SLICE_ORDERED_GROUP_BY) (e.g. in end_send_group()).
+     The one here is transiently used as a model by create_intermediate_table(),
+     to build the tmp table's own tmp_table_param.
   */
   Temp_table_param tmp_table_param;
   MYSQL_LOCK *lock;
 
-  ROLLUP rollup{};         ///< Used with rollup
+  enum class RollupState { NONE, INITED, READY };
+  RollupState rollup_state;
   bool implicit_grouping;  ///< True if aggregated but no GROUP BY
 
   /**
@@ -403,21 +373,13 @@ class JOIN {
   Key_use_array keyuse_array;
 
   /// List storing all expressions used in query block
-  List<Item> &all_fields;
-
-  /// List storing all expressions of select list
-  List<Item> &fields_list;
-
-  /**
-     This is similar to tmp_fields_list, but it also contains necessary
-     extras: expressions added for ORDER BY, GROUP BY, window clauses,
-     underlying items of split items.
-  */
-  List<Item> *tmp_all_fields{nullptr};
+  mem_root_deque<Item *> *query_block_fields;
 
   /**
     Array of pointers to lists of expressions.
-    Each list represents the SELECT list at a certain stage of execution.
+    Each list represents the SELECT list at a certain stage of execution,
+    and also contains necessary extras: expressions added for ORDER BY,
+    GROUP BY, window clauses, underlying items of split items.
     This array is only used when the query makes use of tmp tables: after
     writing to tmp table (e.g. for GROUP BY), if this write also does a
     function's calculation (e.g. of SUM), after the write the function's value
@@ -426,10 +388,9 @@ class JOIN {
     expression (Item_field type instead of Item_sum), is needed. The new
     expressions are listed in JOIN::tmp_fields_list[x]; 'x' is a number
     (REF_SLICE_).
-    Same is applicable to tmp_all_fields.
     @see JOIN::make_tmp_tables_info()
   */
-  List<Item> *tmp_fields_list{nullptr};
+  mem_root_deque<Item *> *tmp_fields = nullptr;
 
   int error{0};  ///< set in optimize(), exec(), prepare_result()
 
@@ -437,6 +398,13 @@ class JOIN {
     ORDER BY and GROUP BY lists, to transform with prepare,optimize and exec
   */
   ORDER_with_src order, group_list;
+
+  // Used so that AggregateIterator knows which items to signal when the rollup
+  // level changes. Obviously only used in the presence of rollup.
+  Prealloced_array<Item_rollup_group_item *, 4> rollup_group_items{
+      PSI_NOT_INSTRUMENTED};
+  Prealloced_array<Item_rollup_sum_switcher *, 4> rollup_sums{
+      PSI_NOT_INSTRUMENTED};
 
   /**
     Any window definitions
@@ -510,7 +478,7 @@ class JOIN {
   plan_idx return_tab{0};
 
   /**
-    ref_items is an array of 5 slices, each containing an array of Item
+    ref_items is an array of 4+ slices, each containing an array of Item
     pointers. ref_items is used in different phases of query execution.
     - slice 0 is initially the same as SELECT_LEX::base_ref_items, ie it is
       the set of items referencing fields from base tables. During optimization
@@ -519,37 +487,29 @@ class JOIN {
       the first temporary table.
     - slice 2 is a representation of the used items when being read from
       the second temporary table.
-    - slice 3 is a representation of the used items when used in
-      aggregation but no actual temporary table is needed.
-    - slice 4 is a copy of the original slice 0. It is created if
+    - slice 3 is a copy of the original slice 0. It is created if
       slice overwriting is necessary, and it is used to restore
       original values in slice 0 after having been overwritten.
-    - slices 5 -> N are used by windowing:
+    - slices 4 -> N are used by windowing:
       first are all the window's out tmp tables,
       the next indexes are reserved for the windows' frame buffers (in the same
       order), if any, e.g.
 
-      One window:      5: window 1's out table
-                       6: window 1's FB
+      One window:      4: window 1's out table
+                       5: window 1's FB
 
-      Two windows:     5: window 1's out table
-                       6: window 2's out table
-                       7: window 1's FB
-                       8: window 2's FB
+      Two windows:     4: window 1's out table
+                       5: window 2's out table
+                       6: window 1's FB
+                       7: window 2's FB
       and so on.
 
-    Slice 0 is allocated for the lifetime of a statement, whereas slices 1-4
+    Slice 0 is allocated for the lifetime of a statement, whereas slices 1-3
     are associated with a single optimization. The size of slice 0 determines
     the slice size used when allocating the other slices.
    */
   Ref_item_array *ref_items{
       nullptr};  // cardinality: REF_SLICE_SAVED_BASE + 1 + #windows*2
-
-  /**
-     If slice REF_SLICE_ORDERED_GROUP_BY has been created, this is the QEP_TAB
-     which is right before calculation of items in this slice.
-  */
-  QEP_TAB *ref_slice_immediately_before_group_by{nullptr};
 
   /**
     The slice currently stored in ref_items[0].
@@ -608,14 +568,6 @@ class JOIN {
   */
   bool with_json_agg;
 
-  /**
-    If set, "fields" has been replaced with a set of Item_refs for rollup
-    processing; see the AggregateIterator constructor for more details.
-    This is used when constructing iterators only; it is not used during
-    execution.
-   */
-  bool replaced_items_for_rollup = false;
-
   /// True if plan is const, ie it will return zero or one rows.
   bool plan_is_const() const { return const_tables == primary_tables; }
 
@@ -627,11 +579,10 @@ class JOIN {
 
   bool optimize();
   void reset();
-  void exec();
   bool prepare_result();
-  bool destroy();
+  void destroy();
   bool alloc_func_list();
-  bool make_sum_func_list(List<Item> &all_fields, List<Item> &send_fields,
+  bool make_sum_func_list(const mem_root_deque<Item *> &fields,
                           bool before_group_by, bool recompute = false);
 
   /**
@@ -670,8 +621,8 @@ class JOIN {
     DBUG_ASSERT((int)sliceno >= 1);
     if (current_ref_item_slice != sliceno) {
       copy_ref_item_slice(REF_SLICE_ACTIVE, sliceno);
-      DBUG_PRINT("info",
-                 ("ref slice %u -> %u", current_ref_item_slice, sliceno));
+      DBUG_PRINT("info", ("JOIN %p ref slice %u -> %u", this,
+                          current_ref_item_slice, sliceno));
       current_ref_item_slice = sliceno;
     }
   }
@@ -684,16 +635,9 @@ class JOIN {
      expressions at the current stage of execution; which stage is denoted by
      the value of current_ref_item_slice.
   */
-  List<Item> *get_current_fields();
+  mem_root_deque<Item *> *get_current_fields();
 
   bool optimize_rollup();
-  bool rollup_process_const_fields();
-  bool rollup_make_fields(List<Item> &all_fields, List<Item> &fields,
-                          Item_sum ***func);
-  bool switch_slice_for_rollup_fields(List<Item> &all_fields,
-                                      List<Item> &fields);
-  bool rollup_send_data(uint idx);
-  bool rollup_write_data(uint idx, QEP_TAB *qep_tab);
   bool finalize_table_conditions();
   /**
     Release memory and, if possible, the open tables held by this execution
@@ -720,7 +664,7 @@ class JOIN {
   */
   bool send_row_on_empty_set() const {
     return (do_send_rows && tmp_table_param.sum_func_count != 0 &&
-            group_list == NULL && !group_optimized_away &&
+            group_list.empty() && !group_optimized_away &&
             select_lex->having_value != Item::COND_FALSE);
   }
 
@@ -736,7 +680,7 @@ class JOIN {
  public:
   bool update_equalities_for_sjm();
   bool add_sorting_to_table(uint idx, ORDER_with_src *order,
-                            bool force_stable_sort = false);
+                            bool force_stable_sort, bool sort_before_group);
   bool decide_subquery_strategy();
   void refine_best_rowcount();
   void recalculate_deps_of_remaining_lateral_derived_tables(
@@ -772,7 +716,7 @@ class JOIN {
   */
   bool fts_index_access(JOIN_TAB *tab);
 
-  Next_select_func get_end_select_func();
+  QEP_TAB::enum_op_type get_end_select_func();
   /**
      Propagate dependencies between tables due to outer join relations.
 
@@ -781,37 +725,14 @@ class JOIN {
   bool propagate_dependencies();
 
   /**
-    Returns whether one should send the current row on to the output,
-    or ignore it. (In particular, this implements OFFSET handling
-    in the non-iterator executor.)
-   */
-  bool should_send_current_row() {
-    if (!do_send_rows) {
-      return false;
-    }
-    if (unit->offset_limit_cnt > 0) {
-      --unit->offset_limit_cnt;
-      return false;
-    } else {
-      return true;
-    }
-  }
-
-  /**
     Handle offloading of query parts to the underlying engines, when
     such is supported by their implementation.
 
-    @returns 0 if success, 1 if error
+    @returns false if success, true if error
   */
-  int push_to_engines();
+  bool push_to_engines();
 
-  RowIterator *root_iterator() const { return m_root_iterator.get(); }
-  unique_ptr_destroy_only<RowIterator> release_root_iterator() {
-    return move(m_root_iterator);
-  }
-  void set_root_iterator(unique_ptr_destroy_only<RowIterator> iterator) {
-    m_root_iterator = move(iterator);
-  }
+  AccessPath *root_access_path() const { return m_root_access_path; }
 
  private:
   bool optimized{false};  ///< flag to avoid double optimization in EXPLAIN
@@ -847,14 +768,15 @@ class JOIN {
     @param tab              the JOIN_TAB object to attach created table to
     @param tmp_table_fields List of items that will be used to define
                             column types of the table.
-    @param tmp_table_group  Group key to use for temporary table, NULL if none.
+    @param tmp_table_group  Group key to use for temporary table, empty if none.
     @param save_sum_fields  If true, do not replace Item_sum items in
                             @c tmp_fields list with Item_field items referring
                             to fields in temporary table.
 
     @returns false on success, true on failure
   */
-  bool create_intermediate_table(QEP_TAB *tab, List<Item> *tmp_table_fields,
+  bool create_intermediate_table(QEP_TAB *tab,
+                                 const mem_root_deque<Item *> &tmp_table_fields,
                                  ORDER_with_src &tmp_table_group,
                                  bool save_sum_fields);
 
@@ -887,7 +809,7 @@ class JOIN {
 
  private:
   void set_prefix_tables();
-  void cleanup_item_list(List<Item> &items) const;
+  void cleanup_item_list(const mem_root_deque<Item *> &items) const;
   void set_semijoin_embedding();
   bool make_join_plan();
   bool init_planner_arrays();
@@ -966,8 +888,7 @@ class JOIN {
   bool add_having_as_tmp_table_cond(uint curr_tmp_table);
   bool make_tmp_tables_info();
   void set_plan_state(enum_plan_state plan_state_arg);
-  bool compare_costs_of_subquery_strategies(
-      Item_exists_subselect::enum_exec_method *method);
+  bool compare_costs_of_subquery_strategies(Subquery_strategy *method);
   ORDER *remove_const(ORDER *first_order, Item *cond, bool change_list,
                       bool *simple_order, bool group_by);
 
@@ -977,7 +898,7 @@ class JOIN {
 
     @retval  1   engine was changed
     @retval  0   engine wasn't changed
-    @retval -1   OOM
+    @retval -1   OOM or other error
   */
   int replace_index_subquery();
 
@@ -1009,35 +930,32 @@ class JOIN {
   bool alloc_indirection_slices();
 
   /**
-    If possible, convert the executor structures to a set of row iterators,
-    storing the result in m_root_iterator. If not, m_root_iterator will remain
-    nullptr.
+    Convert the executor structures to a set of access paths, storing
+    the result in m_root_access_path.
    */
-  void create_iterators();
+  void create_access_paths();
 
   /**
-    Create iterators with the knowledge that there are going to be zero rows
+    Create access paths with the knowledge that there are going to be zero rows
     coming from tables (before aggregation); typically because we know that
     all of them would be filtered away by WHERE (e.g. SELECT * FROM t1
     WHERE 1=2). This will normally yield no output rows, but if we have implicit
     aggregation, it might yield a single one.
    */
-  void create_iterators_for_zero_rows();
+  void create_access_paths_for_zero_rows();
 
-  /** @{ Helpers for create_iterators. */
-  void create_table_iterators();
-  unique_ptr_destroy_only<RowIterator> create_root_iterator_for_join();
-  unique_ptr_destroy_only<RowIterator> attach_iterators_for_having_and_limit(
-      unique_ptr_destroy_only<RowIterator> iterator);
+  void create_access_paths_for_index_subquery();
+
+  /** @{ Helpers for create_access_paths. */
+  AccessPath *create_root_access_path_for_join();
+  AccessPath *attach_access_paths_for_having_and_limit(AccessPath *path);
   /** @} */
 
   /**
-    An iterator you can read from to get all records for this query.
-
-    May be nullptr even after create_iterators() if the current query
-    is not supported by the iterator executor.
+    An access path you can read from to get all records for this query
+    (after you create an iterator from it).
    */
-  unique_ptr_destroy_only<RowIterator> m_root_iterator;
+  AccessPath *m_root_access_path = nullptr;
 };
 
 /**
@@ -1067,40 +985,29 @@ class Switch_ref_item_slice {
   ~Switch_ref_item_slice() { join->set_ref_item_slice(saved); }
 };
 
-/**
-  RAII class to ease the call of LEX::mark_broken() if error.
-  Used during preparation and optimization of DML queries.
-*/
-class Prepare_error_tracker {
- public:
-  explicit Prepare_error_tracker(THD *thd) : m_thd(thd) {}
-  ~Prepare_error_tracker();
-
- private:
-  THD *const m_thd;
-};
-
 bool uses_index_fields_only(Item *item, TABLE *tbl, uint keyno,
                             bool other_tbls_ok);
 bool remove_eq_conds(THD *thd, Item *cond, Item **retcond,
                      Item::cond_result *cond_value);
 bool optimize_cond(THD *thd, Item **conds, COND_EQUAL **cond_equal,
-                   List<TABLE_LIST> *join_list, Item::cond_result *cond_value);
+                   mem_root_deque<TABLE_LIST *> *join_list,
+                   Item::cond_result *cond_value);
 Item *substitute_for_best_equal_field(THD *thd, Item *cond,
                                       COND_EQUAL *cond_equal,
                                       JOIN_TAB **table_join_idx);
 bool build_equal_items(THD *thd, Item *cond, Item **retcond,
                        COND_EQUAL *inherited, bool do_inherit,
-                       List<TABLE_LIST> *join_list,
+                       mem_root_deque<TABLE_LIST *> *join_list,
                        COND_EQUAL **cond_equal_ref);
-bool is_indexed_agg_distinct(JOIN *join, List<Item_field> *out_args);
-Key_use_array *create_keyuse_for_table(THD *thd, uint keyparts,
-                                       Item_field **fields,
-                                       List<Item> outer_exprs);
+bool is_indexed_agg_distinct(JOIN *join,
+                             mem_root_deque<Item_field *> *out_args);
+Key_use_array *create_keyuse_for_table(
+    THD *thd, uint keyparts, Item_field **fields,
+    const mem_root_deque<Item *> &outer_exprs);
 Item_field *get_best_field(Item_field *item_field, COND_EQUAL *cond_equal);
 Item *make_cond_for_table(THD *thd, Item *cond, table_map tables,
                           table_map used_table, bool exclude_expensive_cond);
-uint build_bitmap_for_nested_joins(List<TABLE_LIST> *join_list,
+uint build_bitmap_for_nested_joins(mem_root_deque<TABLE_LIST *> *join_list,
                                    uint first_unused);
 
 /**
@@ -1111,7 +1018,8 @@ uint build_bitmap_for_nested_joins(List<TABLE_LIST> *join_list,
   a later ORDER BY.
  */
 ORDER *create_order_from_distinct(THD *thd, Ref_item_array ref_item_array,
-                                  ORDER *order_list, List<Item> &fields,
+                                  ORDER *order_list,
+                                  const mem_root_deque<Item *> &fields,
                                   bool skip_aggregates,
                                   bool convert_bit_fields_to_long,
                                   bool *all_order_by_fields_used);
@@ -1123,7 +1031,8 @@ ORDER *create_order_from_distinct(THD *thd, Ref_item_array ref_item_array,
    @param  v  Expression
  */
 inline bool field_time_cmp_date(const Field *f, const Item *v) {
-  return f->is_temporal() && !f->is_temporal_with_date() &&
+  const enum_field_types ft = f->type();
+  return is_temporal_type(ft) && !is_temporal_type_with_date(ft) &&
          v->is_temporal_with_date();
 }
 
@@ -1141,8 +1050,8 @@ class Deps_of_remaining_lateral_derived_tables {
   /**
      Constructor.
      @param j                the JOIN
-     @param plan_tables_arg  @see
-                             JOIN::deps_of_remaining_lateral_derived_tables
+     @param plan_tables_arg  table_map of derived tables @see
+     JOIN::deps_of_remaining_lateral_derived_tables
   */
   Deps_of_remaining_lateral_derived_tables(JOIN *j, table_map plan_tables_arg)
       : join(j),
@@ -1196,25 +1105,6 @@ class Deps_of_remaining_lateral_derived_tables {
 double calculate_subquery_executions(const Item_subselect *subquery,
                                      Opt_trace_context *trace);
 
-/**
-  Class which presents a view of the current candidate table order for a JOIN.
-*/
-class Candidate_table_order {
- public:
-  Candidate_table_order(const JOIN *join) : m_join(join) {}
-
-  /// Returns the number of tables in the candidate plan.
-  size_t size() const { return m_join->tables; }
-
-  /// Returns the table reference at the given position in the candidate plan.
-  const TABLE_LIST *table_ref(size_t position) const {
-    return m_join->positions[position].table->table_ref;
-  }
-
- private:
-  const JOIN *const m_join;
-};
-
 extern const char *antijoin_null_cond;
 
 /**
@@ -1228,5 +1118,26 @@ extern const char *antijoin_null_cond;
   evaluated during optimization, or true otherwise
 */
 bool evaluate_during_optimization(const Item *item, const SELECT_LEX *select);
+
+/**
+  Find the multiple equality predicate containing a field.
+
+  The function retrieves the multiple equalities accessed through
+  the cond_equal structure from current level and up looking for
+  an equality containing a field. It stops retrieval as soon as the equality
+  is found and set up inherited_fl to true if it's found on upper levels.
+
+  @param cond_equal          multiple equalities to search in
+  @param item_field          field to look for
+  @param[out] inherited_fl   set up to true if multiple equality is found
+                             on upper levels (not on current level of
+                             cond_equal)
+
+  @return
+    - Item_equal for the found multiple equality predicate if a success;
+    - nullptr otherwise.
+*/
+Item_equal *find_item_equal(COND_EQUAL *cond_equal,
+                            const Item_field *item_field, bool *inherited_fl);
 
 #endif /* SQL_OPTIMIZER_INCLUDED */

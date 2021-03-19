@@ -763,11 +763,14 @@ delete from t1 where a%30=0;
 # This is needed for error-inserts etc.
 source include/check_ndb_debug.inc;
 
+# Disable part of test due to bug:
+# Bug#30754643 NDB.NDBINFO LOCK WAIT TIMEOUT EXCEEDED
+if (0) {
 # This error insert causes the next index scan from SPJ to be queued on node 2.
 # This command may fail if error inserts is not available on this build,
 # therefore we permit return code 255.
 --error 0,255
---exec $NDB_MGM --no-defaults --ndb-connectstring="$NDB_CONNECTSTRING" -e "2 error 5084" >> $NDB_TOOLS_OUTPUT
+--exec $NDB_MGM -e "2 error 5084" >> $NDB_TOOLS_OUTPUT
 
 # Do a pushed query that starts multiple index scans on each t1 fragment.
 # That way the first scan (on node 2) will be queued until the next finishes.
@@ -789,6 +792,7 @@ eval select
 
 # Check how these operations changed the counters. 
 --query_vertical select * from frag_ops;
+}
 
 # This query should give PK read operations with an interpreted program.
 # (Multi-range read mapped to PK reads.)
@@ -929,7 +933,8 @@ select node_id, concat(config_value / 1024 / 1024, 'M') as DataMemory
 set @@ndbinfo_show_hidden=TRUE;
 desc ndb$processes;
 set @@ndbinfo_show_hidden=default;
-show create table processes;
+SELECT view_definition from information_schema.views
+  WHERE table_schema = 'ndbinfo' and table_name = 'processes';
 
 # (B) Tests of table content.
 # These results will change if the cluster config used when running
@@ -1022,4 +1027,21 @@ select *
 # use a hard limit as it will grow when someone add a new error message
 select count(*) > 700
   from ndbinfo.error_messages;
---remove_file $NDB_TOOLS_OUTPUT
+
+desc hwinfo;
+desc cpuinfo;
+desc cpudata;
+desc cpudata_50ms;
+desc cpudata_1sec;
+desc cpudata_20sec;
+
+--disable_result_log
+select * from hwinfo;
+select * from cpuinfo;
+select * from cpudata;
+select * from cpudata_50ms;
+select * from cpudata_1sec;
+select * from cpudata_20sec;
+--enable_result_log
+
+#--remove_file $NDB_TOOLS_OUTPUT

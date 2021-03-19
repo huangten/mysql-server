@@ -1,7 +1,7 @@
 #ifndef SQL_SELECT_INCLUDED
 #define SQL_SELECT_INCLUDED
 
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -27,15 +27,16 @@
   @file sql/sql_select.h
 */
 
-#include <limits.h>
-#include <stddef.h>
 #include <sys/types.h>
+
+#include <climits>
 
 #include "my_base.h"
 #include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_sqlcommand.h"
 #include "my_table_map.h"
+#include "sql/field.h"         // Copy_field
 #include "sql/item_cmpfunc.h"  // Item_cond_and
 #include "sql/opt_costmodel.h"
 #include "sql/sql_bitmap.h"
@@ -43,7 +44,6 @@
 #include "sql/sql_const.h"
 #include "sql/sql_opt_exec_shared.h"  // join_type
 
-class Field;
 class Item;
 class Item_func;
 class JOIN_TAB;
@@ -81,8 +81,9 @@ class Sql_cmd_select : public Sql_cmd_dml {
   const MYSQL_LEX_CSTRING *eligible_secondary_storage_engine() const override;
 
  protected:
+  bool may_use_cursor() const override { return true; }
   bool precheck(THD *thd) override;
-
+  bool check_privileges(THD *thd) override;
   bool prepare_inner(THD *thd) override;
 };
 
@@ -169,8 +170,8 @@ class Key_use {
  public:
   // We need the default constructor for unit testing.
   Key_use()
-      : table_ref(NULL),
-        val(NULL),
+      : table_ref(nullptr),
+        val(nullptr),
         used_tables(0),
         key(0),
         keypart(0),
@@ -178,7 +179,7 @@ class Key_use {
         keypart_map(0),
         ref_table_rows(0),
         null_rejecting(false),
-        cond_guard(NULL),
+        cond_guard(nullptr),
         sj_pred_no(UINT_MAX),
         bound_keyparts(0),
         fanout(0.0),
@@ -226,7 +227,7 @@ class Key_use {
   ha_rows ref_table_rows;    ///< Estimate of how many rows for a key value
   /**
     If true, the comparison this value was created from will not be
-    satisfied if val has NULL 'value'.
+    satisfied if val has NULL 'value' (unless KEY_OPTIMIZE_REF_OR_NULL is set).
     Not used if the index is fulltext (such index cannot be used for
     equalities).
   */
@@ -730,10 +731,10 @@ class JOIN_TAB : public QEP_shared_owner {
 
 inline JOIN_TAB::JOIN_TAB()
     : QEP_shared_owner(),
-      table_ref(NULL),
-      m_keyuse(NULL),
-      m_join_cond_ref(NULL),
-      cond_equal(NULL),
+      table_ref(nullptr),
+      m_keyuse(nullptr),
+      m_join_cond_ref(nullptr),
+      cond_equal(nullptr),
       worst_seeks(0.0),
       const_keys(),
       checked_keys(),
@@ -747,15 +748,15 @@ inline JOIN_TAB::JOIN_TAB()
       used_fieldlength(0),
       use_quick(QS_NONE),
       m_use_join_cache(0),
-      emb_sj_nest(NULL),
+      emb_sj_nest(nullptr),
       embedding_map(0),
       join_cache_flags(0),
       reversed_access(false) {}
 
 /* Extern functions in sql_select.cc */
 void count_field_types(SELECT_LEX *select_lex, Temp_table_param *param,
-                       List<Item> &fields, bool reset_with_sum_func,
-                       bool save_sum_fields);
+                       const mem_root_deque<Item *> &fields,
+                       bool reset_with_sum_func, bool save_sum_fields);
 uint find_shortest_key(TABLE *table, const Key_map *usable_keys);
 
 /* functions from opt_sum.cc */
@@ -769,14 +770,21 @@ enum aggregate_evaluated {
 };
 
 bool optimize_aggregated_query(THD *thd, SELECT_LEX *select,
-                               List<Item> &all_fields, Item *conds,
-                               aggregate_evaluated *decision);
+                               const mem_root_deque<Item *> &all_fields,
+                               Item *conds, aggregate_evaluated *decision);
 
 /* from sql_delete.cc, used by opt_range.cc */
 extern "C" int refpos_order_cmp(const void *arg, const void *a, const void *b);
 
 /// The name of store_key instances that represent constant items.
 constexpr const char *STORE_KEY_CONST_NAME = "const";
+
+/// Check privileges for all columns referenced from join expression
+bool check_privileges_for_join(THD *thd, mem_root_deque<TABLE_LIST *> *tables);
+
+/// Check privileges for all columns referenced from an expression list
+bool check_privileges_for_list(THD *thd, const mem_root_deque<Item *> &items,
+                               ulong privileges);
 
 /** class to copying an field/item to a key struct */
 
@@ -802,6 +810,24 @@ class store_key {
   virtual enum store_key_result copy_inner() = 0;
 };
 
+class store_key_field final : public store_key {
+  Copy_field m_copy_field;
+  const char *m_field_name;
+
+ public:
+  store_key_field(THD *thd, Field *to_field_arg, uchar *ptr,
+                  uchar *null_ptr_arg, uint length, Field *from_field,
+                  const char *name_arg);
+
+  const char *name() const override { return m_field_name; }
+
+  // Change the source field to be another field. Used only by
+  // CreateBKAIterator, when rewriting multi-equalities used in ref access.
+  void replace_from_field(Field *from_field);
+
+ protected:
+  enum store_key_result copy_inner() override;
+};
 class store_key_item : public store_key {
  protected:
   Item *item;
@@ -837,8 +863,6 @@ class store_key_hash_item final : public store_key_item {
 };
 
 bool error_if_full_join(JOIN *join);
-bool handle_query(THD *thd, LEX *lex, Query_result *result,
-                  ulonglong added_options, ulonglong removed_options);
 
 // Statement timeout function(s)
 bool set_statement_timer(THD *thd);
@@ -846,10 +870,8 @@ void reset_statement_timer(THD *thd);
 
 void free_underlaid_joins(THD *thd, SELECT_LEX *select);
 
-void calc_used_field_length(TABLE *table, bool needs_rowid, uint *p_used_fields,
-                            uint *p_used_fieldlength, uint *p_used_blobs,
-                            bool *p_used_null_fields,
-                            bool *p_used_uneven_bit_fields);
+void calc_used_field_length(TABLE *table, bool needs_rowid,
+                            uint *p_used_fieldlength);
 
 ORDER *simple_remove_const(ORDER *order, Item *where);
 bool const_expression_in_where(Item *cond, Item *comp_item,
@@ -879,13 +901,13 @@ bool and_conditions(Item **e1, Item *e2);
   @return the new AND item
 */
 static inline Item *and_items(Item *cond, Item *item) {
-  DBUG_ASSERT(item != NULL);
+  DBUG_ASSERT(item != nullptr);
   return (cond ? (new Item_cond_and(cond, item)) : item);
 }
 
 /// A variant of the above, guaranteed to return Item_bool_func.
 static inline Item_bool_func *and_items(Item *cond, Item_bool_func *item) {
-  DBUG_ASSERT(item != NULL);
+  DBUG_ASSERT(item != nullptr);
   return (cond ? (new Item_cond_and(cond, item)) : item);
 }
 
@@ -901,8 +923,8 @@ bool test_if_cheaper_ordering(const JOIN_TAB *tab, ORDER_with_src *order,
                               TABLE *table, Key_map usable_keys, int key,
                               ha_rows select_limit, int *new_key,
                               int *new_key_direction, ha_rows *new_select_limit,
-                              uint *new_used_key_parts = NULL,
-                              uint *saved_best_key_parts = NULL);
+                              uint *new_used_key_parts = nullptr,
+                              uint *saved_best_key_parts = nullptr);
 /**
   Calculate properties of ref key: key length, number of used key parts,
   dependency map, possibility of null.
